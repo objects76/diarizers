@@ -65,7 +65,7 @@ class Preprocess:
             min_duration=config.min_duration,
             warm_up=config.warm_up
         )
-        model:PyanNet_nn = SegmentationModel(model_config).model
+        model:PyanNet_nn = SegmentationModel(model_config).pyan_nn
 
         # Get the number of frames associated to a chunk:
         _, self.num_frames_per_chunk, n_speakers = model(
@@ -171,18 +171,17 @@ class Preprocess:
         # compute frame resolution:
         # resolution = self.chunk_duration / self.num_frames_per_chunk
 
-
         # discretize chunk annotations at model output resolution
         step = self.receptive_field_step
         half = 0.5 * self.receptive_field_duration
 
         # discretize chunk annotations at model output resolution
-        start1 = np.maximum(chunk_segments["start"], start_time) - start_time - half
-        start_idx = np.maximum(0, np.round(start1 / step)).astype(int)
+        start = np.maximum(chunk_segments["start"], start_time) - start_time - half
+        start_idx = np.maximum(0, np.round(start / step)).astype(int)
         # start_idx = np.floor(start / resolution).astype(int)
 
-        end1 = np.minimum(chunk_segments["end"], end_time) - start_time - half
-        end_idx = np.round(end1 / step).astype(int)
+        end = np.minimum(chunk_segments["end"], end_time) - start_time - half
+        end_idx = np.round(end / step).astype(int)
         # end_idx = np.ceil(end / resolution).astype(int)
 
         # 배열 크기 제한 확인 및 조정 (디버깅 용)
@@ -197,9 +196,9 @@ class Preprocess:
         mapping = {label: idx for idx, label in enumerate(labels)}
         if debug: print(mapping)
 
-        for start, end, label in zip(start_idx, end_idx, chunk_segments["labels"]):
+        for i_start, i_end, label in zip(start_idx, end_idx, chunk_segments["labels"]):
             mapped_label = mapping[label]
-            y[start : end + 1, mapped_label] = 1
+            y[i_start : i_end + 1, mapped_label] = 1
 
         return waveform, y, labels
 

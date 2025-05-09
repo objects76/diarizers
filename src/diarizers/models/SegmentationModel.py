@@ -28,7 +28,7 @@ class SegmentationModelConfig(transformers.PretrainedConfig):
         min_duration=None,
         warm_up=(0.0, 0.0),
         weigh_by_cardinality=False,
-        frame_sec:float = 0,
+        sincnet=None,
         **kwargs,
     ):
         """Init method for the
@@ -66,14 +66,13 @@ class SegmentationModelConfig(transformers.PretrainedConfig):
         self.weigh_by_cardinality = weigh_by_cardinality
         # For now, the model handles only 16000 Hz sampling rate
         self.sample_rate = 16000
-        self.frame_sec = frame_sec
 
         # 추가 코드
-        self.sincnet = kwargs.get("sincnet", {
+        self.sincnet = sincnet or {
             "ksize": 251,
             "stride": 10,
             "frame_sec": 0.10384
-        })
+        }
 
 
 class SegmentationModel(transformers.PreTrainedModel):
@@ -103,12 +102,11 @@ class SegmentationModel(transformers.PreTrainedModel):
         self.min_duration = config.min_duration
         self.warm_up = config.warm_up
         self.max_speakers_per_chunk = config.max_speakers_per_chunk
-        self.frame_sec = config.frame_sec
 
         self.specifications = Specifications(
-            problem=Problem.MULTI_LABEL_CLASSIFICATION
-            if self.max_speakers_per_frame is None
-            else Problem.MONO_LABEL_CLASSIFICATION,
+            problem=Problem.MULTI_LABEL_CLASSIFICATION \
+                if self.max_speakers_per_frame is None
+                else Problem.MONO_LABEL_CLASSIFICATION,
             resolution=Resolution.FRAME,
             duration=self.chunk_duration,
             min_duration=self.min_duration,
@@ -118,9 +116,9 @@ class SegmentationModel(transformers.PreTrainedModel):
             permutation_invariant=True,
         )
 
-        self.model = PyanNet_nn(sincnet=config.sincnet)
-        self.model.specifications = self.specifications
-        self.model.build()
+        self.pyan_nn = PyanNet_nn(sincnet=config.sincnet)
+        self.pyan_nn.specifications = self.specifications
+        self.pyan_nn.build()
         self.setup_loss_func()
 
     def forward(self,
@@ -138,7 +136,7 @@ class SegmentationModel(transformers.PreTrainedModel):
             _type_: _description_
         """
 
-        prediction = self.model(waveforms.unsqueeze(1))
+        prediction = self.pyan_nn(waveforms.unsqueeze(1))
         batch_size, num_frames, _ = prediction.shape
 
         if labels is not None:
@@ -149,10 +147,10 @@ class SegmentationModel(transformers.PreTrainedModel):
             weight[:, num_frames - warm_up_right :] = 0.0
 
             if self.specifications.powerset:
-                multilabel = self.model.powerset.to_multilabel(prediction)
+                multilabel = self.pyan_nn.powerset.to_multilabel(prediction)
                 permutated_target, _ = permutate(multilabel, labels)
 
-                permutated_target_powerset = self.model.powerset.to_powerset(permutated_target.float())
+                permutated_target_powerset = self.pyan_nn.powerset.to_powerset(permutated_target.float())
                 loss = self.segmentation_loss(prediction, permutated_target_powerset, weight=weight)
 
             else:
@@ -166,7 +164,7 @@ class SegmentationModel(transformers.PreTrainedModel):
     def setup_loss_func(self):
         """setup the loss function is self.specifications.powerset is True."""
         if self.specifications.powerset:
-            self.model.powerset = Powerset(
+            self.pyan_nn.powerset = Powerset(
                 len(self.specifications.classes),
                 self.specifications.powerset_max_classes,
             )
@@ -196,7 +194,7 @@ class SegmentationModel(transformers.PreTrainedModel):
 
         if self.specifications.powerset:
             # `clamp_min` is needed to set non-speech weight to 1.
-            class_weight = torch.clamp_min(self.model.powerset.cardinality, 1.0) if self.weigh_by_cardinality else None
+            class_weight = torch.clamp_min(self.pyan_nn.powerset.cardinality, 1.0) if self.weigh_by_cardinality else None
             seg_loss = nll_loss(
                 permutated_prediction,
                 torch.argmax(target, dim=-1),
@@ -210,7 +208,7 @@ class SegmentationModel(transformers.PreTrainedModel):
 
 
     @classmethod
-    def from_pyannote_model(cls, pretrained, with_weight=True, frame_sec=0.):
+    def from_pyannote_model(cls, pretrained, with_weight=True, sincnet=None):
         """Copy the weights and architecture of a pre-trained Pyannote model.
 
         Args:
@@ -234,27 +232,35 @@ class SegmentationModel(transformers.PreTrainedModel):
             min_duration=min_duration,
             warm_up=warm_up,
             max_speakers_per_chunk=max_speakers_per_chunk,
-            frame_sec = frame_sec,
+            sincnet = sincnet,
         )
 
         model:SegmentationModel = cls(config)
 
         # Copy pretrained model weights:
         if with_weight:
-            model.model.hparams = copy.deepcopy(pretrained.hparams)
-            model.model._sincnet = copy.deepcopy(pretrained.sincnet)
-            model.model._sincnet.load_state_dict(pretrained.sincnet.state_dict())
-            # model.model.post_pool = gaussian distribution.
-            model.model.lstm = copy.deepcopy(pretrained.lstm)
-            model.model.lstm.load_state_dict(pretrained.lstm.state_dict())
-            model.model.linear = copy.deepcopy(pretrained.linear)
-            model.model.linear.load_state_dict(pretrained.linear.state_dict())
-            model.model.classifier = copy.deepcopy(pretrained.classifier)
-            model.model.classifier.load_state_dict(pretrained.classifier.state_dict())
-            model.model.activation = copy.deepcopy(pretrained.activation)
-            model.model.activation.load_state_dict(pretrained.activation.state_dict())
-            if model.model.post_pool:
-                print('warning: post_pool not copied from pyannote.PyanNet!')
+            print('before copy:', model.pyan_nn._sincnet_pool)
+            model.pyan_nn.hparams = copy.deepcopy(pretrained.hparams)
+            # 구조적으로 다른 SincNet과 SincNetPool 간의 가중치 복사
+            # model.pyan_nn._sincnet_pool = copy.deepcopy(pretrained.sincnet)
+            # model.pyan_nn._sincnet_pool.load_state_dict(pretrained.sincnet.state_dict())
+            model.pyan_nn._sincnet_pool.wav_norm1d = copy.deepcopy(pretrained.sincnet.wav_norm1d)
+            model.pyan_nn._sincnet_pool.wav_norm1d.load_state_dict(pretrained.sincnet.wav_norm1d.state_dict())
+            model.pyan_nn._sincnet_pool.conv1d = copy.deepcopy(pretrained.sincnet.conv1d)
+            model.pyan_nn._sincnet_pool.conv1d.load_state_dict(pretrained.sincnet.conv1d.state_dict())
+            model.pyan_nn._sincnet_pool.pool1d = copy.deepcopy(pretrained.sincnet.pool1d)
+            model.pyan_nn._sincnet_pool.pool1d.load_state_dict(pretrained.sincnet.pool1d.state_dict())
+            model.pyan_nn._sincnet_pool.norm1d = copy.deepcopy(pretrained.sincnet.norm1d)
+            model.pyan_nn._sincnet_pool.norm1d.load_state_dict(pretrained.sincnet.norm1d.state_dict())
+            # no model.pyan_nn._sincnet_pool.post_pool layer in SincNet
+            model.pyan_nn.lstm = copy.deepcopy(pretrained.lstm)
+            model.pyan_nn.lstm.load_state_dict(pretrained.lstm.state_dict())
+            model.pyan_nn.linear = copy.deepcopy(pretrained.linear)
+            model.pyan_nn.linear.load_state_dict(pretrained.linear.state_dict())
+            model.pyan_nn.classifier = copy.deepcopy(pretrained.classifier)
+            model.pyan_nn.classifier.load_state_dict(pretrained.classifier.state_dict())
+            model.pyan_nn.activation = copy.deepcopy(pretrained.activation)
+            model.pyan_nn.activation.load_state_dict(pretrained.activation.state_dict())
 
         return model
 
@@ -262,27 +268,27 @@ class SegmentationModel(transformers.PreTrainedModel):
         """Convert the current model to a pyannote segmentation model for use in pyannote pipelines."""
 
         seg_model = PyanNet(sincnet={"stride": 10})
-        seg_model.hparams.update(self.model.hparams)
+        seg_model.hparams.update(self.pyan_nn.hparams)
 
-        seg_model.sincnet = copy.deepcopy(self.model._sincnet)
-        seg_model.sincnet.load_state_dict(self.model._sincnet.state_dict())
+        seg_model._sincnet = copy.deepcopy(self.pyan_nn._sincnet_pool)
+        seg_model._sincnet.load_state_dict(self.pyan_nn._sincnet_pool.state_dict())
 
-        if self.model.post_pool:
-            seg_model.post_pool = copy.deepcopy(self.model.post_pool)
-            seg_model.post_pool.load_state_dict(self.model.post_pool.state_dict())
-            print('post_pool copied')
+        # if self.model.post_pool:
+        #     seg_model.post_pool = copy.deepcopy(self.model.post_pool)
+        #     seg_model.post_pool.load_state_dict(self.model.post_pool.state_dict())
+        #     print('post_pool copied')
 
-        seg_model.lstm = copy.deepcopy(self.model.lstm)
-        seg_model.lstm.load_state_dict(self.model.lstm.state_dict())
+        seg_model.lstm = copy.deepcopy(self.pyan_nn.lstm)
+        seg_model.lstm.load_state_dict(self.pyan_nn.lstm.state_dict())
 
-        seg_model.linear = copy.deepcopy(self.model.linear)
-        seg_model.linear.load_state_dict(self.model.linear.state_dict())
+        seg_model.linear = copy.deepcopy(self.pyan_nn.linear)
+        seg_model.linear.load_state_dict(self.pyan_nn.linear.state_dict())
 
-        seg_model.classifier = copy.deepcopy(self.model.classifier)
-        seg_model.classifier.load_state_dict(self.model.classifier.state_dict())
+        seg_model.classifier = copy.deepcopy(self.pyan_nn.classifier)
+        seg_model.classifier.load_state_dict(self.pyan_nn.classifier.state_dict())
 
-        seg_model.activation = copy.deepcopy(self.model.activation)
-        seg_model.activation.load_state_dict(self.model.activation.state_dict())
+        seg_model.activation = copy.deepcopy(self.pyan_nn.activation)
+        seg_model.activation.load_state_dict(self.pyan_nn.activation.state_dict())
 
         seg_model.specifications = self.specifications
 
@@ -318,7 +324,7 @@ class SegmentationModel(transformers.PreTrainedModel):
 
     @cached_property
     def receptive_field(self) -> SlidingWindow:
-        start, size, step = self.model._sincnet.receptive_field()
+        start, size, step = self.pyan_nn._sincnet_pool.receptive_field()
         sr = 16000
         return SlidingWindow(
             start=start / sr,

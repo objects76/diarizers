@@ -35,20 +35,6 @@ class SincNetPool(nn.Module):
 
         # to use pretrained pyan weight and make output granularity bigger.
         self.post_pool = None
-        if frame_sec > 0:
-            assert ksize == 251 and stride == 10, "SincNetPool only supports 251, 10 for now."
-            # 기존 스텝 크기 계산 (대략 0.017307692초)
-            base_step = 0.017307692
-
-            # 목표 스텝 크기(예: 0.102초)에 맞는 풀링 커널 크기 계산
-            pool_kernel: int = math.ceil(frame_sec / base_step)
-            pool_stride: int = pool_kernel
-
-            self.post_pool = (
-                nn.AvgPool1d(kernel_size=pool_kernel, stride=pool_stride, ceil_mode=True)
-            )
-            print(f"SincNetPool: {pool_kernel=}/{frame_sec / base_step:.3f}, {pool_stride=}, {frame_sec=}")
-
 
         # 오디오 신호의 정규화를 위한 1D 인스턴스 정규화 레이어
         self.wav_norm1d = nn.InstanceNorm1d(1, affine=True)
@@ -84,6 +70,21 @@ class SincNetPool(nn.Module):
         self.conv1d.append(nn.Conv1d(in_channels=60, out_channels=60, kernel_size=5, stride=1)) # t
         self.pool1d.append(nn.MaxPool1d(kernel_size=3, stride=3, padding=0, dilation=1))
         self.norm1d.append(nn.InstanceNorm1d(num_features=60, affine=True))
+
+        if frame_sec > 0:
+            assert ksize == 251 and stride == 10, "SincNetPool only supports 251, 10 for now."
+            # 기존 스텝 크기 계산 (대략 0.017307692초)
+            base_step = 0.017307692
+
+            # 목표 스텝 크기(예: 0.102초)에 맞는 풀링 커널 크기 계산
+            pool_kernel: int = math.ceil(frame_sec / base_step)
+            pool_stride: int = pool_kernel
+
+            self.post_pool = (
+                nn.AvgPool1d(kernel_size=pool_kernel, stride=pool_stride, ceil_mode=True)
+            )
+            print(f"SincNetPool: {pool_kernel=}/{frame_sec / base_step:.3f}, {pool_stride=}, {frame_sec=}")
+
 
         self.model_cfg = {
             "kernel_size": [self.ksize, 3, 5, 3, 5, 3],

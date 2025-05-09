@@ -64,14 +64,13 @@ class PyanNet_nn(torch.nn.Module):
 
     def __init__(
         self,
-        sincnet: Optional[dict] = None,
+        sincnet: dict,
         lstm: Optional[dict] = None,
         linear: Optional[dict] = None,
         sample_rate: int = 16000,
         num_channels: int = 1,
     ):
-        super(PyanNet_nn, self).__init__()
-        sincnet = sincnet or SINCNET_DEFAULTS
+        super().__init__()
 
         self.specifications = None
         # sincnet = merge_dict(self.SINCNET_DEFAULTS, sincnet)
@@ -95,7 +94,8 @@ class PyanNet_nn(torch.nn.Module):
             # "sincnet": {"stride": 10, "sample_rate": 16000, },
         })
         print(f"{sincnet=}")
-        self._sincnet = SincNetPool(sample_rate=16000, **sincnet)
+        self.sincnet = sincnet
+        self._sincnet_pool = SincNetPool(sample_rate=16000, **sincnet)
 
         monolithic = lstm["monolithic"]
         if monolithic:
@@ -198,14 +198,14 @@ class PyanNet_nn(torch.nn.Module):
             Number of output frames
         """
         # SincNet에서 처리된 기본 프레임 수 계산
-        n_frames = self._sincnet.num_frames(num_samples)
+        n_frames = self._sincnet_pool.num_frames(num_samples)
         return n_frames
 
 
     @cached_property
     def receptive_field(self) -> SlidingWindow:
         """(Internal) frames"""
-        start, size, step = self._sincnet.receptive_field()
+        start, size, step = self._sincnet_pool.receptive_field()
         sr = 16000
 
         return SlidingWindow(
@@ -232,7 +232,7 @@ class PyanNet_nn(torch.nn.Module):
         scores : (batch, frame, classes)
         """
 
-        outputs = self._sincnet(waveforms)
+        outputs = self._sincnet_pool(waveforms)
 
         if self.hparams.lstm["monolithic"]:
             outputs, _ = self.lstm(
@@ -310,7 +310,7 @@ class PyanNet(Model):
 
     def __init__(
         self,
-        sincnet: Optional[dict] = None,
+        sincnet: dict,
         lstm: Optional[dict] = None,
         linear: Optional[dict] = None,
         sample_rate: int = 16000,
@@ -319,17 +319,16 @@ class PyanNet(Model):
     ):
         super().__init__(sample_rate=sample_rate, num_channels=num_channels, task=task)
 
-        sincnet = merge_dict(self.SINCNET_DEFAULTS, sincnet)
-        sincnet["sample_rate"] = sample_rate
         lstm = merge_dict(self.LSTM_DEFAULTS, lstm)
         lstm["batch_first"] = True
         linear = merge_dict(self.LINEAR_DEFAULTS, linear)
         self.save_hyperparameters("sincnet", "lstm", "linear")
 
+        sincnet = sincnet or SINCNET_DEFAULTS
         # print( 'self.hparams.sincnet', self.hparams.sincnet)
         # print( 'pyan.hparams.sincnet', self.hparams)
-
-        self.sincnet = SincNetPool(sample_rate=16000, **SINCNET_DEFAULTS)
+        self.sincnet = sincnet
+        self._sincnet = SincNetPool(sample_rate=16000, **sincnet)
 
         monolithic = lstm["monolithic"]
         if monolithic:
@@ -416,7 +415,7 @@ class PyanNet(Model):
             Number of output frames
         """
 
-        value = self.sincnet.num_frames(num_samples)
+        value = self._sincnet.num_frames(num_samples)
         print(f"PyanNet: {value=}, {num_samples=}")
         return value
 
@@ -437,7 +436,7 @@ class PyanNet(Model):
         scores : (batch, frame, classes)
         """
 
-        outputs = self.sincnet(waveforms)
+        outputs = self._sincnet(waveforms)
 
         if self.hparams.lstm["monolithic"]:
             outputs, _ = self.lstm(
