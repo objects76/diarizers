@@ -12,107 +12,42 @@ from denoiser import pretrained
 from denoiser.dsp import convert_audio
 from tqdm import tqdm
 
-from datasets import Audio, Dataset, concatenate_datasets, load_dataset
+import datasets
+from datasets import Audio, Dataset
 
+from dataclasses import dataclass, field
 
+@dataclass
 class SyntheticDatasetConfig:
-    def __init__(
-        self,
-        dataset_name: str,
-        subset: str,
-        split: str,
-        speaker_column_name: str,
-        audio_column_name: str,
-        min_samples_per_speaker: int = 10,
-        nb_speakers_from_dataset: int = -1,
-        sample_rate: int = 16000,
-        num_meetings: int = 1600,
-        nb_speakers_per_meeting: int = 3,
-        segments_per_meeting: int = 16,
-        normalize: bool = True,
-        augment: bool = False,
-        overlap_proba: float = 0.3,
-        overlap_length: float = 3,
-        random_gain: bool = False,
-        add_silence: bool = True,
-        silence_duration: float = 3,
-        silence_proba: float = 0.7,
-        denoise: bool = False,
-        bn_path: str = None,
-        ir_path: str = None,
-        num_proc: int = 2,
-    ) -> None:
-        """_summary_
+    dataset_name: str
+    subset: str
+    split: str
+    speaker_column_name: str
+    audio_column_name: str
+    min_samples_per_speaker: int = 10
+    nb_speakers_from_dataset: int = -1
+    sample_rate: int = 16000
+    num_meetings: int = 1600
+    nb_speakers_per_meeting: int = 3
+    segments_per_meeting: int = 16
+    normalize: bool = True
+    augment: bool = False
+    overlap_proba: float = 0.3
+    overlap_length: float = 3
+    random_gain: bool = False
+    add_silence: bool = True
+    silence_duration: float = 3
+    silence_proba: float = 0.7
+    denoise: bool = False
+    bn_path: str|None = None
+    ir_path: str|None = None
+    num_proc: int = 2
+    hf_cache_dir:str|None = None
 
-        Args:
-            dataset_name (str, optional): name of the ASR dataset to be used to generate synthetic meetings. Defaults to "mozilla-foundation/common_voice_17_0".
-            subset (str, optional): ASR dataset subset. Defaults to 'validated'.
-            split (str, optional): ASR dataset split. Defaults to "ja".
-            speaker_column_name (str, optional): name of the audio column feature in the ASR dataset. Defaults to 'client_id'.
-            audio_column_name (str, optional): name of the speaker column feature in the ASR dataset. Defaults to 'audio'.
-            min_samples_per_speaker (int, optional):
-                Minimal number of audio samples associated to a given speaker in the ASR dataset to use him in synthetic meeting generation. Defaults to 10.
-            nb_speakers_from_dataset (int, optional):
-                Number of speakers to keep for synthetic meeting generation. The speakers with the highest number of audio segments will be kept.
-                Defaults to 200.
-            sample_rate (int, optional): sample rate of the generated meetings. Defaults to 16000.
-            num_meetings (int, optional): number of meeting audio files to generate. Defaults to 1600.
-            nb_speakers_per_meeting (int, optional): number of speakers per generated meeting. Defaults to 3.
-            segments_per_meeting (int, optional): number of audio segments used in a generated meeting. Defaults to 16.
-            normalize (bool, optional): Whether to normalise audio segments. Defaults to True.
-            augment (bool, optional): Add background noise and reverberation to recorded meetings. Defaults to False.
-            overlap_proba (float, optional): Probability of adding overlap to successive audio segments. Defaults to 0.3.
-            overlap_length (float, optional): Maximum overlap time (in seconds) between two overlapping audio segments. Defaults to 3.
-            random_gain (bool, optional): Apply random gain to each audio segments. Defaults to False.
-            add_silence (bool, optional): Add silence or not in generated meeting. Defaults to True.
-            silence_duration (float, optional): maximum silence duration (in seconds). Defaults to 3.
-            silence_proba (float, optional): probability of adding a silence in a generated meeting. Defaults to 0.7.
-            denoise (bool, optional): Whether to denoise or not the generated meeting. Defaults to False.
-            bn_path (str, optional): Path to background noise samples. Defaults to None.
-            ir_path (str, optional): path to impulse response samples. Defaults to None.
-            num_proc (int, optional): Number of processes. Defaults to 2.
-        """
-
-        # ASR dataset params:
-        self.dataset_name = dataset_name
-        self.subset = subset
-        self.split = split
-        self.min_samples_per_speaker = min_samples_per_speaker
-        self.speaker_column_name = speaker_column_name
-        self.audio_column_name = audio_column_name
-        self.nb_speakers_from_dataset = nb_speakers_from_dataset
-        self.sample_rate = sample_rate
-
-        # Synthetic meetings meta params:
-        self.num_meetings = num_meetings
-        self.nb_speakers_per_meeting = nb_speakers_per_meeting
-        self.segments_per_meeting = segments_per_meeting
-
-        # Synthetic meetings properties:
-        # add overlap
-        self.overlap_proba = overlap_proba
-        self.overlap_length = overlap_length
-
-        # add silences:
-        self.add_silence = add_silence
-        self.silence_duration = silence_duration
-        self.silence_proba = silence_proba
-
-        # normalize
-        self.normalize = normalize
-
-        # Augment
-        self.augment = augment
-        self.bn_path = bn_path
-        self.ir_path = ir_path
-
-        # denoise:
-        self.denoise = denoise
-
-        # add random gain:
-        self.random_gain = random_gain
-
-        self.num_proc = num_proc
+    def __post_init__(self):
+        """Post-initialization checks and adjustments."""
+        assert self.num_proc <= self.num_meetings, "please make sure num_proc <= num_meetings"
+        # Additional initialization logic can be added here if needed.
 
 
 class SyntheticDataset:
@@ -164,8 +99,12 @@ class SyntheticDataset:
         assert self.num_proc <= self.num_meetings, "please make sure num_proc <= num_meetings"
 
         # Load ASR dataset:
-        dataset = load_dataset(str(self.dataset_name), str(self.split))
-        self.dataset = dataset[str(self.subset)].select_columns(
+        path = str(self.dataset_name)
+        subset = str(self.subset)
+        dataset = datasets.load_dataset(
+            path=path, name=subset, split=self.split,
+            cache_dir= config.hf_cache_dir)
+        self.dataset = dataset.select_columns(
             [str(self.speaker_column_name), str(self.audio_column_name)]
         )
 
@@ -247,17 +186,21 @@ class SyntheticDataset:
 
         return self.current_speaker
 
-    def sample_meeting_segments(self):
+    def sample_meeting_segments(self) -> Dataset:
         """Sample segments that will be used for meeting generation:
 
         Returns:
             batch_samples (HuggingFace dataset): batch of audio segments to be concatenated to form a meeting.
         """
 
-        batch_samples = Dataset.from_dict({str(self.speaker_column_name): [], str(self.audio_column_name): []})
+        batch_samples = Dataset.from_dict({
+            str(self.speaker_column_name): [],
+            str(self.audio_column_name): []
+            })
 
         # Sample nb_speakers_per_meeting from the list of speakers_to_sample_from:
-        self.sampled_speakers = random.sample(self.speakers_to_sample_from, self.nb_speakers_per_meeting)
+        self.sampled_speakers = random.sample(
+            self.speakers_to_sample_from, self.nb_speakers_per_meeting)
         # Get the pool of segments associated with the speakers:
         self.audio_index_pool = {
             speaker: self.speaker_indexes_in_dataset[str(speaker)].copy() for speaker in self.sampled_speakers
@@ -327,7 +270,7 @@ class SyntheticDataset:
         audio_file = self.augmentation_pipeline(samples=audio_file, sample_rate=self.sample_rate)
         return audio_file
 
-    def refine_audio_segment_timestamps(self, audio_segment, speaker):
+    def refine_audio_segment_timestamps(self, audio_segment, speaker, boundary_only=False):
         """Refine audio_segment timestamps using a Voice Activity Detector.
 
         Args:
@@ -347,6 +290,11 @@ class SyntheticDataset:
             audio_segment_start_index = int(speech_timestamps[0]["start"])
             audio_segment_end_index = int(speech_timestamps[-1]["end"])
             audio_segment = audio_segment[audio_segment_start_index:audio_segment_end_index]
+
+            if boundary_only:
+                speech_timestamps = [{
+                    "start": audio_segment_start_index,
+                    "end": audio_segment_end_index}]
 
             file_timestamps_start = [
                 (timestamps["start"] - speech_timestamps[0]["start"]) / self.sample_rate
@@ -539,7 +487,9 @@ class SyntheticDataset:
 
         sr = files["audio"][0]["sampling_rate"]
 
-        batch = [{key: values[i] for key, values in files.items()} for i in range(len(files["audio"]))]
+        batch = [{key: values[i] for key, values in files.items()}
+                 for i in range(len(files["audio"]))]
+        assert len(batch) == self.segments_per_meeting
 
         file_timestamps_start = []
         file_timestamps_end = []
@@ -556,6 +506,7 @@ class SyntheticDataset:
                 audio_segment = self.add_gain_to_audio_segment(audio_segment)
 
             # Refine segment level timestamps:
+            boundary_only = self.segments_per_meeting <= 2 # jjkim
             (
                 audio_segment,
                 timestamps_start_vad,
@@ -564,14 +515,26 @@ class SyntheticDataset:
             ) = self.refine_audio_segment_timestamps(
                 audio_segment,
                 element[self.speaker_column_name],
+                boundary_only= boundary_only
             )
             file_timestamps_start.append(timestamps_start_vad)
             file_timestamps_end.append(timestamps_end_vad)
             speakers.append(speakers_vad)
             audio_segments.append(audio_segment)
 
-        (audio_file, file_timestamps_start, file_timestamps_end, speakers) = self.create_meeting(
-            audio_segments, file_timestamps_start, file_timestamps_end, speakers
+        if len(speakers) != 2:
+            print(f"warning {speakers=} == 2")
+
+        (
+            audio_file,
+            file_timestamps_start,
+            file_timestamps_end,
+            speakers
+        ) = self.create_meeting(
+            audio_segments,
+            file_timestamps_start,
+            file_timestamps_end,
+            speakers
         )
 
         if self.add_silence:
@@ -579,7 +542,10 @@ class SyntheticDataset:
                 audio_file,
                 file_timestamps_start,
                 file_timestamps_end,
-            ) = self.add_silences_to_audio_segment(audio_file, file_timestamps_start, file_timestamps_end)
+            ) = self.add_silences_to_audio_segment(
+                audio_file,
+                file_timestamps_start,
+                file_timestamps_end)
 
         if self.denoise:
             audio_file = self.denoise_audio_segment(audio_file, rank=rank)
@@ -602,9 +568,7 @@ class SyntheticDataset:
 
         return new_batch
 
-    def generate(
-        self,
-    ):
+    def generate(self) -> Dataset:
         """Main method to generate a speaker diarization synthetic dataset.
 
         Returns:
@@ -628,9 +592,10 @@ class SyntheticDataset:
         for _ in tqdm(range(self.num_meetings)):
 
             meeting_samples = self.sample_meeting_segments()
-            audio_samples = concatenate_datasets([audio_samples, meeting_samples])
+            audio_samples = datasets.concatenate_datasets([audio_samples, meeting_samples])
 
         # Concatenate the selected audio segments to form meetings:
+        assert self.segments_per_meeting == 2
         final_dataset = audio_samples.map(
             self.concatenate,
             batched=True,
@@ -638,7 +603,7 @@ class SyntheticDataset:
             remove_columns=audio_samples.column_names,
             with_rank=True,
             num_proc=self.num_proc,
-        ).cast_column("audio", Audio(sampling_rate=self.sample_rate))
+        ).cast_column("audio", datasets.Audio(sampling_rate=self.sample_rate))
 
         if self.num_proc > 1:
             copyreg.dispatch_table.pop(type(self.vad_model), None)
@@ -646,3 +611,31 @@ class SyntheticDataset:
                 os.remove("vad.pt")
 
         return final_dataset
+
+
+from datasets import Dataset, DatasetDict
+
+
+import hashlib
+import diskcache as dc # pip install diskcache
+
+def key(s): return hashlib.md5(str(s).encode("utf-8")).hexdigest()
+
+_cache = dc.Cache('./cache')
+
+def generate(configs: list[SyntheticDatasetConfig]) -> Dataset|DatasetDict:
+    result = {}
+    for config in configs:
+        dataset:Dataset = _cache.get( key(config) )
+        if dataset is None:
+            print('>>> generating...', config.subset, config.split)
+            dataset = SyntheticDataset(config).generate()
+            _cache[ key(config) ] = dataset #
+
+        result[config.subset] = dataset
+        print('    ', config.subset, ':', str(dataset))
+
+    if len(result) == 1:
+        return dataset
+
+    return DatasetDict(result)

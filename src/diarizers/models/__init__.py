@@ -1,1 +1,1 @@
-from .model import SegmentationModel, SegmentationModelConfig
+from .SegmentationModel import SegmentationModel, SegmentationModelConfig

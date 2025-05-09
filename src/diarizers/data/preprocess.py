@@ -26,7 +26,7 @@ import numpy as np
 import torch
 
 from ..models import SegmentationModel
-
+from pyannote.core import SlidingWindow # jjkim
 
 class Preprocess:
     """Converts a HF dataset with the following features:
@@ -40,6 +40,7 @@ class Preprocess:
     def __init__(
         self,
         config,
+        n_receptive_field_frame,
     ):
         """Preprocess init method.
         Takes as input the dataset to process and the model to perform training with.
@@ -55,12 +56,20 @@ class Preprocess:
         self.warm_up = config.warm_up
 
         self.sample_rate = config.sample_rate
-        self.model = SegmentationModel(config).to_pyannote_model()
+        model = SegmentationModel(config).to_pyannote_model()
 
         # Get the number of frames associated to a chunk:
-        _, self.num_frames_per_chunk, _ = self.model(
+        _, self.num_frames_per_chunk, n_speakers = model(
             torch.rand((1, int(self.chunk_duration * self.sample_rate)))
         ).shape
+
+        self.receptive_field_step = model.receptive_field.step
+        self.receptive_field_duration = 0.5 * model.receptive_field.duration
+        self.post_pool_size = model.post_pool.kernel_size[0] if model.post_pool else 0
+
+        if n_receptive_field_frame > 0:
+            self.num_frames_per_chunk = n_receptive_field_frame
+        print(f"{self.num_frames_per_chunk=} for {self.chunk_duration}")
 
     def get_labels_in_file(self, file):
         """Get speakers in file.
@@ -78,7 +87,7 @@ class Preprocess:
 
         return file_labels
 
-    def get_segments_in_file(self, file, labels):
+    def get_segments_in_file(self, file, labels) -> np.ndarray:
         """Get segments in file.
 
         Args:
@@ -99,11 +108,12 @@ class Preprocess:
 
         dtype = [("start", "<f4"), ("end", "<f4"), ("labels", "i1")]
 
+        # [(start, end, label), ...]
         annotations = np.array(file_annotations, dtype)
-
         return annotations
 
-    def get_chunk(self, file, start_time):
+    def get_chunk(self, file, start_time, min_speaker,
+                  debug=False) -> tuple[np.ndarray, np.ndarray, list] | None:
         """Method used to get an audio chunk from an audio file given a start_time.
 
         Args:
@@ -111,11 +121,12 @@ class Preprocess:
             start_time (float): start time (in seconds) of the audio_chunk to extract.
 
         Returns:
-            waveform (array): audio chunk
-            y (numpy array): target array.
-            labels (list): list of speakers in chunk.
+            tuple of (waveform, y, labels) or None:
+                waveform (np.ndarray): audio chunk
+                y (np.ndarray): target array.
+                labels (list): list of speakers in chunk.
+                None: if the chunk doesn't meet requirements.
         """
-
         sample_rate = file["audio"][0]["sampling_rate"]
 
         assert sample_rate == self.sample_rate
@@ -125,43 +136,97 @@ class Preprocess:
         num_frames_waveform = math.floor(self.chunk_duration * sample_rate)
         end_frame = start_frame + num_frames_waveform
 
-        waveform = file["audio"][0]["array"][start_frame:end_frame]
+        waveform:np.ndarray = file["audio"][0]["array"][start_frame:end_frame]
+        if len(waveform) < num_frames_waveform:
+            padding_length = num_frames_waveform - len(waveform)
+            waveform = np.pad(waveform, (0, padding_length), 'constant', constant_values=0)
+
+        assert len(waveform) == num_frames_waveform
 
         labels = self.get_labels_in_file(file)
+        # print('get_chunk.labels:', labels)
 
-        file_segments = self.get_segments_in_file(file, labels)
+        file_segments = self.get_segments_in_file(file, labels); del labels
+        # print('file_segments:', file_segments)
 
-        chunk_segments = file_segments[(file_segments["start"] < end_time) & (file_segments["end"] > start_time)]
-
-        # compute frame resolution:
-        # resolution = self.chunk_duration / self.num_frames_per_chunk
-
-        # discretize chunk annotations at model output resolution
-        step = self.model.receptive_field.step
-        half = 0.5 * self.model.receptive_field.duration
-
-        # discretize chunk annotations at model output resolution
-        start = np.maximum(chunk_segments["start"], start_time) - start_time - half
-        start_idx = np.maximum(0, np.round(start / step)).astype(int)
-
-        # start_idx = np.floor(start / resolution).astype(int)
-        end = np.minimum(chunk_segments["end"], end_time) - start_time - half
-        end_idx = np.round(end / step).astype(int)
-
-        # end_idx = np.ceil(end / resolution).astype(int)
+        # overlapped segments.
+        chunk_segments = file_segments[
+            (file_segments["start"] < end_time) & (file_segments["end"] > start_time)]
+        # print('chunk_segments:', chunk_segments)
 
         # get list and number of labels for current scope
         labels = list(np.unique(chunk_segments["labels"]))
         num_labels = len(labels)
+        if num_labels < min_speaker:
+            return None
+
+        # compute frame resolution:
+        # resolution = self.chunk_duration / self.num_frames_per_chunk
+
+
+        # discretize chunk annotations at model output resolution
+        step = self.receptive_field_step
+        half = 0.5 * self.receptive_field_duration
+
+        # 스텝 정보 출력 (디버깅 목적)
+        # DEV이 True일 때만 출력하도록 수정
+        if debug:
+            print(f"Receptive field: step={step:.6f}s, duration={self.receptive_field_duration:.6f}s")
+            if self.post_pool_size:
+                print(f"Using post_pool with kernel_size={self.post_pool_size}")
+
+        # discretize chunk annotations at model output resolution
+        start1 = np.maximum(chunk_segments["start"], start_time) - start_time - half
+        start_idx = np.maximum(0, np.round(start1 / step)).astype(int)
+        # start_idx = np.floor(start / resolution).astype(int)
+
+        end1 = np.minimum(chunk_segments["end"], end_time) - start_time - half
+        end_idx = np.round(end1 / step).astype(int)
+        # end_idx = np.ceil(end / resolution).astype(int)
+
+        # 배열 크기 제한 확인 및 조정 (디버깅 용)
+        if debug and max(end_idx) >= self.num_frames_per_chunk:
+            print(f"Warning: end_idx {max(end_idx)} exceeds num_frames_per_chunk {self.num_frames_per_chunk}")
+            end_idx = np.minimum(end_idx, self.num_frames_per_chunk - 1)
+
         # initial frame-level targets
         y = np.zeros((self.num_frames_per_chunk, num_labels), dtype=np.uint8)
 
         # map labels to indices
         mapping = {label: idx for idx, label in enumerate(labels)}
+        if debug: print(mapping)
 
         for start, end, label in zip(start_idx, end_idx, chunk_segments["labels"]):
             mapped_label = mapping[label]
             y[start : end + 1, mapped_label] = 1
+
+        #+ jjkim
+        if self.post_pool_size:
+            n_combine = self.post_pool_size
+            n_label = n_combine * math.ceil(y.shape[0] / n_combine)
+            ypadded = np.pad(y,
+                       # 0 rows before, 10 rows after, 0 cols before or after
+                       pad_width=((0, n_combine-1), (0,  0)),
+                       mode='edge'
+            )
+            blocks = ypadded[:n_label].reshape(-1, n_combine, ypadded.shape[1])
+            avg = blocks.mean(axis=1)
+            if debug: print('merged label:', str(avg).replace('\n', ','))
+
+            # result = np.round(avg).astype(np.uint8)
+            result = np.where(avg >= 0.4, 1, 0).astype(np.uint8) # (avg > 0.7) ? 1:0
+            if debug: print(f'{n_combine=}, {y.shape=}, {ypadded.shape=}, {result.shape=}')
+            y = result # (22,2)
+
+            # manual filtering
+            # [1 0] ([0 1] or [0 0]) - removable: this case will be removed by chunked embedding?
+            if np.array_equal(y[0], [1, 0]) and y[1][0] != 1:
+                return None
+
+            # if only 1 speaker after blocks.mean
+            if len(np.unique(y, axis=0)) == 1:
+                return None
+        #- jjkim
 
         return waveform, y, labels
 
@@ -180,17 +245,39 @@ class Preprocess:
         sample_rate = file["audio"][0]["sampling_rate"]
 
         assert sample_rate == self.sample_rate
+        assert overlap < 1, f"overlap must be less than 1"
+        assert self.chunk_duration > 0.0, f"self.chunk_duration must be greater than 0.0"
 
+        step = 1 - overlap
         file_duration = len(file["audio"][0]["array"]) / sample_rate
-        start_positions = np.arange(0, file_duration - self.chunk_duration, self.chunk_duration * (1 - overlap))
+        start_positions = np.arange(0, file_duration - self.chunk_duration, step = step)
 
         if random:
-            nb_samples = int(file_duration / self.chunk_duration)
+            nb_samples = int(file_duration / self.chunk_duration) # number of batch_samples
             start_positions = np.random.uniform(0, file_duration, nb_samples)
 
         return start_positions
 
-    def __call__(self, file, random=False, overlap=0.0):
+    def apply_eval(self, file):
+        DEV = False
+
+        new_batch = {"waveforms": [], "labels": [], "nb_speakers": []}
+
+        start_positions = [0]
+        if DEV: print(f'{start_positions=}')
+
+        for start_time in start_positions:
+            result = self.get_chunk(file, start_time, min_speaker=2)
+            if result is None: continue
+
+            waveform, target, label = result
+            new_batch["waveforms"].append(waveform)
+            new_batch["labels"].append(target)
+            new_batch["nb_speakers"].append(label)
+
+        return new_batch
+
+    def __call__(self, file, random=False, overlap=0.0, min_person=2):
         """Chunk an audio file into short segments of duration self.chunk_duration
 
         Args:
@@ -201,6 +288,7 @@ class Preprocess:
         Returns:
             new_batch: new batch containing for each chunk the corresponding waveform, labels and number of speakers.
         """
+        DEV = False
 
         new_batch = {"waveforms": [], "labels": [], "nb_speakers": []}
 
@@ -208,10 +296,13 @@ class Preprocess:
             start_positions = self.get_start_positions(file, overlap, random=True)
         else:
             start_positions = self.get_start_positions(file, overlap)
+            if DEV: print(f'{start_positions=}')
 
         for start_time in start_positions:
-            waveform, target, label = self.get_chunk(file, start_time)
+            result = self.get_chunk(file, start_time, min_speaker=min_person)
+            if result is None: continue
 
+            waveform, target, label = result
             new_batch["waveforms"].append(waveform)
             new_batch["labels"].append(target)
             new_batch["nb_speakers"].append(label)

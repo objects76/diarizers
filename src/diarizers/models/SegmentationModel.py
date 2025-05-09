@@ -1,18 +1,19 @@
 import copy
 from typing import Optional
+from pathlib import Path
 
 import torch
 from pyannote.audio.core.task import Problem, Resolution, Specifications
-from pyannote.audio.models.segmentation import PyanNet
 from pyannote.audio.utils.loss import binary_cross_entropy, nll_loss
 from pyannote.audio.utils.permutation import permutate
 from pyannote.audio.utils.powerset import Powerset
-from transformers import PretrainedConfig, PreTrainedModel
+import transformers
 
 from diarizers.models.pyannet import PyanNet_nn
+from diarizers.models.pyannet import PyanNet
 
 
-class SegmentationModelConfig(PretrainedConfig):
+class SegmentationModelConfig(transformers.PretrainedConfig):
     """Config class associated with SegmentationModel model."""
 
     model_type = "pyannet"
@@ -25,6 +26,7 @@ class SegmentationModelConfig(PretrainedConfig):
         min_duration=None,
         warm_up=(0.0, 0.0),
         weigh_by_cardinality=False,
+        frame_sec:float = 0,
         **kwargs,
     ):
         """Init method for the
@@ -62,16 +64,17 @@ class SegmentationModelConfig(PretrainedConfig):
         self.weigh_by_cardinality = weigh_by_cardinality
         # For now, the model handles only 16000 Hz sampling rate
         self.sample_rate = 16000
+        self.frame_sec = frame_sec
 
 
-class SegmentationModel(PreTrainedModel):
+class SegmentationModel(transformers.PreTrainedModel):
     """
     Wrapper class for the PyanNet segmentation model used in pyannote.
     Inherits from Pretrained model to be compatible with the HF Trainer.
     Can be used to train segmentation models to be used for the "SpeakerDiarisation Task" in pyannote.
     """
 
-    config_class = SegmentationModelConfig
+    # config_class = SegmentationModelConfig
 
     def __init__(
         self,
@@ -84,7 +87,6 @@ class SegmentationModel(PreTrainedModel):
 
         super().__init__(config)
 
-        self.model = PyanNet_nn(sincnet={"stride": 10})
 
         self.weigh_by_cardinality = config.weigh_by_cardinality
         self.max_speakers_per_frame = config.max_speakers_per_frame
@@ -92,6 +94,7 @@ class SegmentationModel(PreTrainedModel):
         self.min_duration = config.min_duration
         self.warm_up = config.warm_up
         self.max_speakers_per_chunk = config.max_speakers_per_chunk
+        self.frame_sec = config.frame_sec
 
         self.specifications = Specifications(
             problem=Problem.MULTI_LABEL_CLASSIFICATION
@@ -105,11 +108,16 @@ class SegmentationModel(PreTrainedModel):
             powerset_max_classes=self.max_speakers_per_frame,
             permutation_invariant=True,
         )
+
+        self.model = PyanNet_nn(sincnet={"stride": 10}, frame_sec=config.frame_sec)
         self.model.specifications = self.specifications
         self.model.build()
         self.setup_loss_func()
 
-    def forward(self, waveforms, labels=None, nb_speakers=None):
+    def forward(self,
+                waveforms: torch.Tensor,
+                labels: Optional[torch.Tensor] = None,
+                nb_speakers: Optional[int] = None) -> dict:
         """foward pass of the Pretrained Model.
 
         Args:
@@ -191,8 +199,9 @@ class SegmentationModel(PreTrainedModel):
 
         return seg_loss
 
+
     @classmethod
-    def from_pyannote_model(cls, pretrained):
+    def from_pyannote_model(cls, pretrained, with_weight=True, frame_sec=0.):
         """Copy the weights and architecture of a pre-trained Pyannote model.
 
         Args:
@@ -216,22 +225,27 @@ class SegmentationModel(PreTrainedModel):
             min_duration=min_duration,
             warm_up=warm_up,
             max_speakers_per_chunk=max_speakers_per_chunk,
+            frame_sec = frame_sec,
         )
 
-        model = cls(config)
+        model:SegmentationModel = cls(config)
 
         # Copy pretrained model weights:
-        model.model.hparams = copy.deepcopy(pretrained.hparams)
-        model.model.sincnet = copy.deepcopy(pretrained.sincnet)
-        model.model.sincnet.load_state_dict(pretrained.sincnet.state_dict())
-        model.model.lstm = copy.deepcopy(pretrained.lstm)
-        model.model.lstm.load_state_dict(pretrained.lstm.state_dict())
-        model.model.linear = copy.deepcopy(pretrained.linear)
-        model.model.linear.load_state_dict(pretrained.linear.state_dict())
-        model.model.classifier = copy.deepcopy(pretrained.classifier)
-        model.model.classifier.load_state_dict(pretrained.classifier.state_dict())
-        model.model.activation = copy.deepcopy(pretrained.activation)
-        model.model.activation.load_state_dict(pretrained.activation.state_dict())
+        if with_weight:
+            model.model.hparams = copy.deepcopy(pretrained.hparams)
+            model.model._sincnet = copy.deepcopy(pretrained.sincnet)
+            model.model._sincnet.load_state_dict(pretrained.sincnet.state_dict())
+            # model.model.post_pool = gaussian distribution.
+            model.model.lstm = copy.deepcopy(pretrained.lstm)
+            model.model.lstm.load_state_dict(pretrained.lstm.state_dict())
+            model.model.linear = copy.deepcopy(pretrained.linear)
+            model.model.linear.load_state_dict(pretrained.linear.state_dict())
+            model.model.classifier = copy.deepcopy(pretrained.classifier)
+            model.model.classifier.load_state_dict(pretrained.classifier.state_dict())
+            model.model.activation = copy.deepcopy(pretrained.activation)
+            model.model.activation.load_state_dict(pretrained.activation.state_dict())
+            if model.model.post_pool:
+                print('warning: post_pool not copied from pyannote.PyanNet!')
 
         return model
 
@@ -241,8 +255,13 @@ class SegmentationModel(PreTrainedModel):
         seg_model = PyanNet(sincnet={"stride": 10})
         seg_model.hparams.update(self.model.hparams)
 
-        seg_model.sincnet = copy.deepcopy(self.model.sincnet)
-        seg_model.sincnet.load_state_dict(self.model.sincnet.state_dict())
+        seg_model.sincnet = copy.deepcopy(self.model._sincnet)
+        seg_model.sincnet.load_state_dict(self.model._sincnet.state_dict())
+
+        if self.model.post_pool:
+            seg_model.post_pool = copy.deepcopy(self.model.post_pool)
+            seg_model.post_pool.load_state_dict(self.model.post_pool.state_dict())
+            print('post_pool copied')
 
         seg_model.lstm = copy.deepcopy(self.model.lstm)
         seg_model.lstm.load_state_dict(self.model.lstm.state_dict())
@@ -259,3 +278,31 @@ class SegmentationModel(PreTrainedModel):
         seg_model.specifications = self.specifications
 
         return seg_model
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint: str|Path) -> 'SegmentationModel':
+        """Load a model from a checkpoint directory.
+
+        Args:
+            checkpoint (str): Path to the checkpoint directory containing `config.json` and `model.safetensors`.
+
+        Returns:
+            SegmentationModel: An instance of SegmentationModel with loaded configuration and weights.
+        """
+        import json
+        from safetensors.torch import load_file
+        # Load configuration
+        config_path = Path(checkpoint) / "config.json"
+        with open(config_path, 'r') as f:
+            config_dict = json.load(f)
+        config = SegmentationModelConfig(**config_dict)
+
+        # Initialize model with configuration
+        model = cls(config)
+
+        # Load model weights
+        model_weights_path = Path(checkpoint) / "model.safetensors"
+        state_dict = load_file(model_weights_path)
+        model.load_state_dict(state_dict)
+
+        return model

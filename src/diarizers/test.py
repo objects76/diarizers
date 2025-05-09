@@ -168,6 +168,153 @@ class Test:
         }
 
 
+
+class TestWhole:
+
+    def __init__(self, test_dataset, model, step=0):
+        """init method
+
+        Args:
+            test_dataset (_type_): Hugging Face speaker diarization test dataset
+            model (SegmentationModel): SegmentationModel used at inference.
+            step (float, optional): Steps between successive generated audio chunks. Defaults to 2.5.
+        """
+
+        self.test_dataset = test_dataset
+        self.model = model
+        (self.device,) = get_devices(needs=1)
+        self.inference = Inference(self.model, window="whole", step=None, device=self.device)
+
+        self.sample_rate = test_dataset[0]["audio"]["sampling_rate"]
+
+        # Get the number of frames associated to a chunk:
+        _, self.num_frames, _ = self.inference.model(
+            torch.rand((1, int(self.inference.duration * self.sample_rate))).to(self.device)
+        ).shape
+        # compute frame resolution:
+        self.resolution = self.inference.duration / self.num_frames
+
+        self.metrics = {
+            "der": DiarizationErrorRate(0.5).to(self.device),
+            "confusion": SpeakerConfusionRate(0.5).to(self.device),
+            "missed_detection": MissedDetectionRate(0.5).to(self.device),
+            "false_alarm": FalseAlarmRate(0.5).to(self.device),
+        }
+        print(f"{self.resolution= }, {self.inference.duration= }, {self.num_frames= }")
+
+    def predict(self, file) -> np.ndarray:
+        """Make a prediction on a dataset row,
+            using pyannote inference object.
+
+        Args:
+            file (_type_): _description_
+
+        Returns:
+            _type_: _description_
+        """
+        audio = torch.tensor(file["audio"]["array"]).unsqueeze(0).to(torch.float32)
+        sample_rate = file["audio"]["sampling_rate"]
+
+        input = {"waveform": audio.to(self.device), "sample_rate": sample_rate}
+
+        prediction = self.inference(input)
+
+        return prediction
+
+    def compute_gt(self, file: dict) -> np.ndarray:
+        """
+        Args:
+            file (_type_): dataset row.
+
+        Returns:
+            gt: numpy array with shape (num_frames, num_speakers).
+        """
+
+        audio = torch.tensor(file["audio"]["array"]).unsqueeze(0).to(torch.float32)
+        sample_rate = file["audio"]["sampling_rate"]
+
+        audio_duration = len(audio[0]) / sample_rate
+        num_frames = int(round(audio_duration / self.resolution))
+
+        labels = list(set(file["speakers"])) # A,B
+
+        gt = np.zeros((num_frames, len(labels)), dtype=np.uint8) # (100,2)
+
+        for start, end, speaker in zip(
+            file["timestamps_start"],
+            file["timestamps_end"],
+            file["speakers"]
+        ):
+            start_frame = int(round(start / self.resolution))
+            end_frame = int(round(end / self.resolution))
+            speaker_index = labels.index(speaker)
+
+            gt[start_frame:end_frame, speaker_index] += 1
+            # [
+            #   1(A)
+            #   0
+            #   3(A,B)
+            #   2(B)
+            #]
+
+        return gt
+
+    def compute_metrics_on_file(self, file):
+        """
+        Compute and update metrics on a dataset row without using sliding windows.
+
+        Args:
+            file (dict): A Hugging Face dataset row.
+        """
+        gt = self.compute_gt(file)
+        prediction = self.predict(file)
+
+
+        # Ensure GT and predictions have the same number of frames
+        num_frames = min(gt.shape[0], prediction.shape[0])
+        gt = gt[:num_frames]
+        prediction = prediction[:num_frames]
+
+
+        # Handle mismatched speaker counts by padding
+        n_framegt, gt_num_speakers = gt.shape
+        n_framepr, pred_num_speakers = prediction.shape
+        assert n_framepr == n_framegt
+
+        if pred_num_speakers > gt_num_speakers:
+            gt = np.pad(gt, ((0, 0), (0, pred_num_speakers - gt_num_speakers)))
+        elif gt_num_speakers > pred_num_speakers:
+            prediction = np.pad(prediction, ((0, 0), (0, gt_num_speakers - pred_num_speakers)))
+
+        # Convert GT and predictions to tensors for metric computation
+        pred_tensor = torch.tensor(prediction).unsqueeze(0).permute(0, 2, 1).to(self.device)
+        target_tensor = torch.tensor(gt).unsqueeze(0).permute(0, 2, 1).to(self.device)
+
+        # Update metrics
+        self.metrics["der"](pred_tensor, target_tensor)  # Diarization Error Rate
+        self.metrics["false_alarm"](pred_tensor, target_tensor)
+        self.metrics["missed_detection"](pred_tensor, target_tensor)
+        self.metrics["confusion"](pred_tensor, target_tensor)
+
+    def compute_metrics(self):
+        """Main method, used to compute speaker diarization metrics on test_dataset.
+        Returns:
+            dict: metric values.
+        """
+
+        for file in tqdm(self.test_dataset):
+            self.compute_metrics_on_file(file)
+
+
+        result = {
+            "der": self.metrics["der"].compute(),
+            "false_alarm": self.metrics["false_alarm"].compute(),
+            "missed_detection": self.metrics["missed_detection"].compute(),
+            "confusion": self.metrics["confusion"].compute(),
+        }
+
+        return {k: v.item() for k, v in result.items()}
+
 class TestPipeline:
     def __init__(self, test_dataset, pipeline) -> None:
 
