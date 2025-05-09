@@ -22,11 +22,12 @@
 # SOFTWARE.
 import math
 
+from diarizers.models.pyannet import PyanNet_nn
 import numpy as np
 import torch
 
-from ..models import SegmentationModel
-from pyannote.core import SlidingWindow # jjkim
+from diarizers.models import SegmentationModel, SegmentationModelConfig
+
 
 class Preprocess:
     """Converts a HF dataset with the following features:
@@ -40,7 +41,6 @@ class Preprocess:
     def __init__(
         self,
         config,
-        n_receptive_field_frame,
     ):
         """Preprocess init method.
         Takes as input the dataset to process and the model to perform training with.
@@ -56,7 +56,16 @@ class Preprocess:
         self.warm_up = config.warm_up
 
         self.sample_rate = config.sample_rate
-        model = SegmentationModel(config).to_pyannote_model()
+
+        # 올바른 SegmentationModelConfig로 모델 초기화
+        model_config = SegmentationModelConfig(
+            chunk_duration=config.chunk_duration,
+            max_speakers_per_frame=config.max_speakers_per_frame,
+            max_speakers_per_chunk=config.max_speakers_per_chunk,
+            min_duration=config.min_duration,
+            warm_up=config.warm_up
+        )
+        model:PyanNet_nn = SegmentationModel(model_config).model
 
         # Get the number of frames associated to a chunk:
         _, self.num_frames_per_chunk, n_speakers = model(
@@ -65,10 +74,9 @@ class Preprocess:
 
         self.receptive_field_step = model.receptive_field.step
         self.receptive_field_duration = 0.5 * model.receptive_field.duration
-        self.post_pool_size = model.post_pool.kernel_size[0] if model.post_pool else 0
-
-        if n_receptive_field_frame > 0:
-            self.num_frames_per_chunk = n_receptive_field_frame
+        # self.post_pool_size = model.post_pool.kernel_size[0] if model.post_pool else 0
+        print(f"{model.receptive_field.step=}")
+        print(f"{model.receptive_field.duration=}")
         print(f"{self.num_frames_per_chunk=} for {self.chunk_duration}")
 
     def get_labels_in_file(self, file):
@@ -168,13 +176,6 @@ class Preprocess:
         step = self.receptive_field_step
         half = 0.5 * self.receptive_field_duration
 
-        # 스텝 정보 출력 (디버깅 목적)
-        # DEV이 True일 때만 출력하도록 수정
-        if debug:
-            print(f"Receptive field: step={step:.6f}s, duration={self.receptive_field_duration:.6f}s")
-            if self.post_pool_size:
-                print(f"Using post_pool with kernel_size={self.post_pool_size}")
-
         # discretize chunk annotations at model output resolution
         start1 = np.maximum(chunk_segments["start"], start_time) - start_time - half
         start_idx = np.maximum(0, np.round(start1 / step)).astype(int)
@@ -199,34 +200,6 @@ class Preprocess:
         for start, end, label in zip(start_idx, end_idx, chunk_segments["labels"]):
             mapped_label = mapping[label]
             y[start : end + 1, mapped_label] = 1
-
-        #+ jjkim
-        if self.post_pool_size:
-            n_combine = self.post_pool_size
-            n_label = n_combine * math.ceil(y.shape[0] / n_combine)
-            ypadded = np.pad(y,
-                       # 0 rows before, 10 rows after, 0 cols before or after
-                       pad_width=((0, n_combine-1), (0,  0)),
-                       mode='edge'
-            )
-            blocks = ypadded[:n_label].reshape(-1, n_combine, ypadded.shape[1])
-            avg = blocks.mean(axis=1)
-            if debug: print('merged label:', str(avg).replace('\n', ','))
-
-            # result = np.round(avg).astype(np.uint8)
-            result = np.where(avg >= 0.4, 1, 0).astype(np.uint8) # (avg > 0.7) ? 1:0
-            if debug: print(f'{n_combine=}, {y.shape=}, {ypadded.shape=}, {result.shape=}')
-            y = result # (22,2)
-
-            # manual filtering
-            # [1 0] ([0 1] or [0 0]) - removable: this case will be removed by chunked embedding?
-            if np.array_equal(y[0], [1, 0]) and y[1][0] != 1:
-                return None
-
-            # if only 1 speaker after blocks.mean
-            if len(np.unique(y, axis=0)) == 1:
-                return None
-        #- jjkim
 
         return waveform, y, labels
 
@@ -308,3 +281,44 @@ class Preprocess:
             new_batch["nb_speakers"].append(label)
 
         return new_batch
+
+if __name__ == "__main__":
+    from dataclasses import dataclass
+
+    @dataclass
+    class PreprocessConfig:
+        chunk_duration: float = 2.25
+        max_speakers_per_frame: int = 2
+        max_speakers_per_chunk: int = 2
+        min_duration: float = 0.0
+        warm_up: float = 0.0
+        sample_rate: int = 16000
+
+    processor = Preprocess(PreprocessConfig())
+
+    def save_test_chunk(file: dict, start_time: float, min_speaker: int, output_dir: str) -> None:
+        # Get the chunk using the processor
+        result = processor.get_chunk(file, start_time=start_time, min_speaker=min_speaker)
+        if result is None:
+            print("No valid chunk found.")
+            return
+
+        waveform, target, label = result
+
+        # Prepare data to save
+        chunk_data = {
+            "waveform": waveform.tolist(),
+            "target": target.tolist(),
+            "label": label
+        }
+        print(f"{waveform.shape=}, {target.shape=}, {label=}")
+        target_str = str(target).replace('\n', '')
+        print(f"{target_str=}")
+
+    test_file = {
+        "audio": [{"sampling_rate": 16000, "array": np.random.rand(int(16000 * 2.25))}],  # 2.25 seconds of random audio
+        "speakers": [[0, 1]],
+        "timestamps_start": [[0.0, 1.120]],
+        "timestamps_end": [[1.125, 2.25]]
+    }
+    save_test_chunk(test_file, start_time=0, min_speaker=2, output_dir="test_chunks")

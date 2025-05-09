@@ -21,8 +21,9 @@ class Dict(dict):
         super(Dict, self).__init__(*args, **kwargs)
         self.__dict__ = self
 
-SINCNET_DEFAULTS = {"ksize": 251, "stride": 10}
-SINCNET_DEFAULTS = {"ksize": 321, "stride": 56}
+SINCNET_DEFAULTS = {"ksize": 251, "stride": 10, "frame_sec": 0} # to use pyan pretrained
+SINCNET_DEFAULTS = {"ksize": 251, "stride": 10, "frame_sec": 0.10384} # to use pyan pretrained, 22 frams for 2.25 sec
+SINCNET_DEFAULTS = {"ksize": 321, "stride": 56} # 21 frames for 2.25 sec
 
 class PyanNet_nn(torch.nn.Module):
     """PyanNet segmentation model adapted from PyanNet model used in pyannote.
@@ -52,7 +53,6 @@ class PyanNet_nn(torch.nn.Module):
         i.e. two linear layers with 128 units each.
     """
 
-    # SINCNET_DEFAULTS = {"stride": 10}
     LSTM_DEFAULTS = {
         "hidden_size": 128,
         "num_layers": 4,
@@ -69,9 +69,9 @@ class PyanNet_nn(torch.nn.Module):
         linear: Optional[dict] = None,
         sample_rate: int = 16000,
         num_channels: int = 1,
-        frame_sec:float = 0.
     ):
         super(PyanNet_nn, self).__init__()
+        sincnet = sincnet or SINCNET_DEFAULTS
 
         self.specifications = None
         # sincnet = merge_dict(self.SINCNET_DEFAULTS, sincnet)
@@ -94,23 +94,8 @@ class PyanNet_nn(torch.nn.Module):
             "sample_rate": 16000,
             # "sincnet": {"stride": 10, "sample_rate": 16000, },
         })
-        print('diar.self.hparams', self.hparams)
-        self._sincnet = SincNetPool(sample_rate=16000, **SINCNET_DEFAULTS)
-
-
-        self.post_pool = None
-        if frame_sec > 0:
-            # 기존 스텝 크기 계산 (대략 0.017307692초)
-            base_step = 0.017307692
-
-            # 목표 스텝 크기(예: 0.102초)에 맞는 풀링 커널 크기 계산
-            pool_kernel: int = math.ceil(frame_sec / base_step)
-            pool_stride: int = pool_kernel
-
-            self.post_pool = (
-                nn.AvgPool1d(kernel_size=pool_kernel, stride=pool_stride, ceil_mode=True)
-            )
-            print(f"PyanNet: {pool_kernel=}, {pool_stride=}, target_step={frame_sec}, base_step={base_step}")
+        print(f"{sincnet=}")
+        self._sincnet = SincNetPool(sample_rate=16000, **sincnet)
 
         monolithic = lstm["monolithic"]
         if monolithic:
@@ -214,80 +199,26 @@ class PyanNet_nn(torch.nn.Module):
         """
         # SincNet에서 처리된 기본 프레임 수 계산
         n_frames = self._sincnet.num_frames(num_samples)
-
-        # post_pool이 있으면 풀링에 의한 프레임 수 감소를 계산
-        if self.post_pool is not None:
-            pool_kernel = self.post_pool.kernel_size[0] if isinstance(self.post_pool.kernel_size, tuple) else self.post_pool.kernel_size
-            pool_stride = self.post_pool.stride[0] if isinstance(self.post_pool.stride, tuple) else self.post_pool.stride
-            pool_padding = self.post_pool.padding if hasattr(self.post_pool, 'padding') else 0
-
-            # 평균 풀링 후 프레임 수 계산 공식
-            # out_length = (in_length + 2*padding - kernel_size) / stride + 1
-            n_frames = (n_frames + 2*pool_padding - pool_kernel) // pool_stride + 1
-
         return n_frames
 
 
     @cached_property
     def receptive_field(self) -> SlidingWindow:
         """(Internal) frames"""
-        _receptive_field_size = self._sincnet.receptive_field_size(num_frames=1)
-        _receptive_field_step = (
-            self._sincnet.receptive_field_size(num_frames=2) - _receptive_field_size
-        )
-        receptive_field_start = (
-            self._sincnet.receptive_field_center(frame=0) - (_receptive_field_size - 1) / 2
-        )
+        start, size, step = self._sincnet.receptive_field()
         sr = 16000
 
-        # 기본값
-        start_sec = receptive_field_start / sr
-        duration_sec = _receptive_field_size / sr
-        step_sec = _receptive_field_step / sr
-
-        # 만약 post_pool이 존재한다면, 스텝 크기를 조정
-        if self.post_pool is not None:
-            pool_kernel = self.post_pool.kernel_size[0]
-            step_sec = step_sec * pool_kernel  # 풀링 커널 크기에 비례하여 스텝 증가
-            # duration은 변경하지 않음 - 원래 receptive field 크기 유지
-
         return SlidingWindow(
-            start=start_sec,
-            duration=duration_sec,
-            step=step_sec,  # 0.102초(약 0.0173 * 6)로 설정될 것임
+            start = start / sr,
+            duration = size / sr,
+            step = step / sr,
         )
 
-
-
-    def receptive_field_size(self, num_frames: int = 1) -> int:
-        """Compute size of receptive field
-
-        Parameters
-        ----------
-        num_frames : int, optional
-            Number of frames in the output signal
-
-        Returns
-        -------
-        receptive_field_size : int
-            Receptive field size.
-        """
-        return self._sincnet.receptive_field_size(num_frames=num_frames)
-
-    def receptive_field_center(self, frame: int = 0) -> int:
-        """Compute center of receptive field
-
-        Parameters
-        ----------
-        frame : int, optional
-            Frame index
-
-        Returns
-        -------
-        receptive_field_center : int
-            Index of receptive field center.
-        """
-        return self._sincnet.receptive_field_center(frame=frame)
+    # def receptive_field_size(self, num_frames: int = 1) -> int:
+    #     return self._sincnet._receptive_field_size(num_frames=num_frames)
+    #
+    # def receptive_field_center(self, frame: int = 0) -> int:
+    #     return self._sincnet._receptive_field_center(frame=frame)
 
     def forward(self, waveforms: torch.Tensor) -> torch.Tensor:
         """Pass forward
@@ -302,9 +233,6 @@ class PyanNet_nn(torch.nn.Module):
         """
 
         outputs = self._sincnet(waveforms)
-
-        if self.post_pool is not None:
-            outputs = self.post_pool(outputs)
 
         if self.hparams.lstm["monolithic"]:
             outputs, _ = self.lstm(
@@ -402,7 +330,6 @@ class PyanNet(Model):
         # print( 'pyan.hparams.sincnet', self.hparams)
 
         self.sincnet = SincNetPool(sample_rate=16000, **SINCNET_DEFAULTS)
-        self.post_pool = None
 
         monolithic = lstm["monolithic"]
         if monolithic:
@@ -493,40 +420,10 @@ class PyanNet(Model):
         print(f"PyanNet: {value=}, {num_samples=}")
         return value
 
-    def receptive_field_size(self, num_frames: int = 1) -> int:
-        """Compute size of receptive field
-
-        Parameters
-        ----------
-        num_frames : int, optional
-            Number of frames in the output signal
-
-        Returns
-        -------
-        receptive_field_size : int
-            Receptive field size.
-        """
-        value = self.sincnet.receptive_field_size(num_frames=num_frames)
-        # print(f"PyanNet.receptive_field_size: {value=}, {num_frames=}")
-        return value
-
-    def receptive_field_center(self, frame: int = 0) -> int:
-        """Compute center of receptive field
-
-        Parameters
-        ----------
-        frame : int, optional
-            Frame index
-
-        Returns
-        -------
-        receptive_field_center : int
-            Index of receptive field center.
-        """
-
-        value = self.sincnet.receptive_field_center(frame=frame)
-        # print(f"PyanNet.receptive_field_center: {value=}, {frame=}")
-        return value
+    # def receptive_field_size(self, num_frames: int = 1) -> int:
+    #     return self.sincnet._receptive_field_size(num_frames=num_frames)
+    # def receptive_field_center(self, frame: int = 0) -> int:
+    #     return self.sincnet._receptive_field_center(frame=frame)
 
     def forward(self, waveforms: torch.Tensor) -> torch.Tensor:
         """Pass forward
@@ -541,8 +438,6 @@ class PyanNet(Model):
         """
 
         outputs = self.sincnet(waveforms)
-        if self.post_pool is not None:
-            outputs = self.post_pool(outputs)
 
         if self.hparams.lstm["monolithic"]:
             outputs, _ = self.lstm(

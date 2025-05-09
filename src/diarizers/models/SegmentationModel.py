@@ -12,6 +12,8 @@ import transformers
 from diarizers.models.pyannet import PyanNet_nn
 from diarizers.models.pyannet import PyanNet
 
+from functools import cached_property
+from pyannote.core import SlidingWindow
 
 class SegmentationModelConfig(transformers.PretrainedConfig):
     """Config class associated with SegmentationModel model."""
@@ -66,6 +68,13 @@ class SegmentationModelConfig(transformers.PretrainedConfig):
         self.sample_rate = 16000
         self.frame_sec = frame_sec
 
+        # 추가 코드
+        self.sincnet = kwargs.get("sincnet", {
+            "ksize": 251,
+            "stride": 10,
+            "frame_sec": 0.10384
+        })
+
 
 class SegmentationModel(transformers.PreTrainedModel):
     """
@@ -109,7 +118,7 @@ class SegmentationModel(transformers.PreTrainedModel):
             permutation_invariant=True,
         )
 
-        self.model = PyanNet_nn(sincnet={"stride": 10}, frame_sec=config.frame_sec)
+        self.model = PyanNet_nn(sincnet=config.sincnet)
         self.model.specifications = self.specifications
         self.model.build()
         self.setup_loss_func()
@@ -306,3 +315,16 @@ class SegmentationModel(transformers.PreTrainedModel):
         model.load_state_dict(state_dict)
 
         return model
+
+    @cached_property
+    def receptive_field(self) -> SlidingWindow:
+        start, size, step = self.model._sincnet.receptive_field()
+        sr = 16000
+        return SlidingWindow(
+            start=start / sr,
+            duration= size / sr,
+            step=step / sr,
+        )
+
+if __name__ == "__main__":
+    ...
