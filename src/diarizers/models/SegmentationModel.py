@@ -15,20 +15,28 @@ from diarizers.models.pyannet import PyanNet
 from functools import cached_property
 from pyannote.core import SlidingWindow
 
+_sincnet:dict|None = None
+
 class SegmentationModelConfig(transformers.PretrainedConfig):
     """Config class associated with SegmentationModel model."""
+
+    @staticmethod
+    def set_sincnet(cfg):
+        global _sincnet
+        print(f'SegmentationModelConfig: _sincnet: {_sincnet}\n -> {cfg}')
+        _sincnet = cfg
 
     model_type = "pyannet"
 
     def __init__(
         self,
+        *,
         chunk_duration=10,
         max_speakers_per_frame=2,
         max_speakers_per_chunk=3,
         min_duration=None,
         warm_up=(0.0, 0.0),
         weigh_by_cardinality=False,
-        sincnet=None,
         **kwargs,
     ):
         """Init method for the
@@ -68,11 +76,10 @@ class SegmentationModelConfig(transformers.PretrainedConfig):
         self.sample_rate = 16000
 
         # 추가 코드
-        self.sincnet = sincnet or {
-            "ksize": 251,
-            "stride": 10,
-            "frame_sec": 0.10384
-        }
+        global _sincnet
+        if _sincnet is None:
+            print(f'warning: \33[101m {self.__class__.__name__}: sincnet is required: {_sincnet=} \33[0m')
+        self.sincnet = _sincnet
 
 
 class SegmentationModel(transformers.PreTrainedModel):
@@ -82,11 +89,10 @@ class SegmentationModel(transformers.PreTrainedModel):
     Can be used to train segmentation models to be used for the "SpeakerDiarisation Task" in pyannote.
     """
 
-    # config_class = SegmentationModelConfig
-
     def __init__(
         self,
-        config=SegmentationModelConfig(),
+        *,
+        config, # =SegmentationModelConfig(),
     ):
         """init method
         Args:
@@ -119,21 +125,27 @@ class SegmentationModel(transformers.PreTrainedModel):
         self.pyan_nn = PyanNet_nn(sincnet=config.sincnet)
         self.pyan_nn.specifications = self.specifications
         self.pyan_nn.build()
-        self.setup_loss_func()
+        self._setup_loss_func()
 
     def forward(self,
                 waveforms: torch.Tensor,
                 labels: Optional[torch.Tensor] = None,
-                nb_speakers: Optional[int] = None) -> dict:
-        """foward pass of the Pretrained Model.
+                nb_speakers: Optional[int] = None,
+                each_loss: bool = False) -> dict:
+        """Forward pass of the Pretrained Model.
 
         Args:
-            waveforms (torch.tensor): _description_
-            labels (_type_, optional): _description_. Defaults to None.
-            nb_speakers (_type_, optional): _description_. Defaults to None.
+            waveforms (torch.Tensor): 오디오 파형 텐서. Shape: (batch_size, num_samples).
+                16kHz 샘플링 레이트의 raw 오디오 파형이어야 합니다.
+            labels (torch.Tensor, optional): 화자 활동 레이블 텐서.
+                Shape: (batch_size, num_frames, num_speakers). Defaults to None.
+            nb_speakers (int, optional): 오디오 클립의 총 화자 수.
+                일부 처리 로직에서 사용될 수 있습니다. Defaults to None.
 
         Returns:
-            _type_: _description_
+            dict: 다음 키를 포함하는 결과 딕셔너리
+                - "logits": 모델의 화자 활동 예측값 (batch_size, num_frames, num_classes)
+                - "loss": labels가 제공된 경우의 계산된 손실 값
         """
 
         prediction = self.pyan_nn(waveforms.unsqueeze(1))
@@ -151,17 +163,27 @@ class SegmentationModel(transformers.PreTrainedModel):
                 permutated_target, _ = permutate(multilabel, labels)
 
                 permutated_target_powerset = self.pyan_nn.powerset.to_powerset(permutated_target.float())
-                loss = self.segmentation_loss(prediction, permutated_target_powerset, weight=weight)
+                loss = self._segmentation_loss(prediction, permutated_target_powerset, weight=weight, each_loss=each_loss)
 
             else:
                 permutated_prediction, _ = permutate(labels, prediction)
-                loss = self.segmentation_loss(permutated_prediction, labels, weight=weight)
+                loss = self._segmentation_loss(permutated_prediction, labels, weight=weight, each_loss=each_loss)
 
-            return {"loss": loss, "logits": prediction}
+            if each_loss:
+                return {"logits": prediction, "loss": loss.mean(), "losses": loss}
+            else:
+                return {"logits": prediction, "loss": loss}
 
         return {"logits": prediction}
 
-    def setup_loss_func(self):
+    def test(self,
+             waveforms: torch.Tensor,
+             labels: torch.Tensor) -> dict:
+        with torch.no_grad():
+            return self.forward(waveforms, labels, each_loss=True)
+
+
+    def _setup_loss_func(self):
         """setup the loss function is self.specifications.powerset is True."""
         if self.specifications.powerset:
             self.pyan_nn.powerset = Powerset(
@@ -169,11 +191,12 @@ class SegmentationModel(transformers.PreTrainedModel):
                 self.specifications.powerset_max_classes,
             )
 
-    def segmentation_loss(
+    def _segmentation_loss(
         self,
         permutated_prediction: torch.Tensor,
         target: torch.Tensor,
         weight: Optional[torch.Tensor] = None,
+        each_loss: bool = False
     ) -> torch.Tensor:
         """Permutation-invariant segmentation loss
 
@@ -185,30 +208,65 @@ class SegmentationModel(transformers.PreTrainedModel):
             Speaker activity.
         weight : (batch_size, num_frames, 1) torch.Tensor, optional
             Frames weight.
+        each_loss : bool, optional
+            If True, returns individual loss for each batch item. Default is False.
 
         Returns
         -------
         seg_loss : torch.Tensor
-            Permutation-invariant segmentation loss
+            If each_loss is False: Permutation-invariant segmentation loss (scalar)
+            If each_loss is True: Tensor of shape (batch_size,) with loss per batch item
         """
+        batch_size = permutated_prediction.shape[0]
+        device = permutated_prediction.device
 
-        if self.specifications.powerset:
-            # `clamp_min` is needed to set non-speech weight to 1.
-            class_weight = torch.clamp_min(self.pyan_nn.powerset.cardinality, 1.0) if self.weigh_by_cardinality else None
-            seg_loss = nll_loss(
-                permutated_prediction,
-                torch.argmax(target, dim=-1),
-                class_weight=class_weight,
-                weight=weight,
-            )
+        if each_loss:
+            item_losses = torch.zeros(batch_size, device=device)
+
+            if self.specifications.powerset:
+                for i in range(batch_size):
+                    # `clamp_min` is needed to set non-speech weight to 1.
+                    class_weight = torch.clamp_min(self.pyan_nn.powerset.cardinality, 1.0) if self.weigh_by_cardinality else None
+                    batch_weight = weight[i:i+1] if weight is not None else None
+
+                    item_loss = nll_loss(
+                        permutated_prediction[i:i+1],
+                        torch.argmax(target[i:i+1], dim=-1),
+                        class_weight=class_weight,
+                        weight=batch_weight,
+                    )
+                    item_losses[i] = item_loss
+            else:
+                for i in range(batch_size):
+                    batch_weight = weight[i:i+1] if weight is not None else None
+
+                    item_loss = binary_cross_entropy(
+                        permutated_prediction[i:i+1],
+                        target[i:i+1].float(),
+                        weight=batch_weight,
+                    )
+                    item_losses[i] = item_loss
+
+            return item_losses
         else:
-            seg_loss = binary_cross_entropy(permutated_prediction, target.float(), weight=weight)
+            # 기존 코드: 배치 전체 손실 계산
+            if self.specifications.powerset:
+                # `clamp_min` is needed to set non-speech weight to 1.
+                class_weight = torch.clamp_min(self.pyan_nn.powerset.cardinality, 1.0) if self.weigh_by_cardinality else None
+                seg_loss = nll_loss(
+                    permutated_prediction,
+                    torch.argmax(target, dim=-1),
+                    class_weight=class_weight,
+                    weight=weight,
+                )
+            else:
+                seg_loss = binary_cross_entropy(permutated_prediction, target.float(), weight=weight)
 
-        return seg_loss
+            return seg_loss
 
 
     @classmethod
-    def from_pyannote_model(cls, pretrained, with_weight=True, sincnet=None):
+    def from_pyannote_model(cls, pretrained, *, with_weight=True):
         """Copy the weights and architecture of a pre-trained Pyannote model.
 
         Args:
@@ -232,10 +290,9 @@ class SegmentationModel(transformers.PreTrainedModel):
             min_duration=min_duration,
             warm_up=warm_up,
             max_speakers_per_chunk=max_speakers_per_chunk,
-            sincnet = sincnet,
         )
 
-        model:SegmentationModel = cls(config)
+        model:SegmentationModel = cls(config=config)
 
         # Copy pretrained model weights:
         if with_weight:
@@ -246,8 +303,19 @@ class SegmentationModel(transformers.PreTrainedModel):
             # model.pyan_nn._sincnet_pool.load_state_dict(pretrained.sincnet.state_dict())
             model.pyan_nn._sincnet_pool.wav_norm1d = copy.deepcopy(pretrained.sincnet.wav_norm1d)
             model.pyan_nn._sincnet_pool.wav_norm1d.load_state_dict(pretrained.sincnet.wav_norm1d.state_dict())
-            model.pyan_nn._sincnet_pool.conv1d = copy.deepcopy(pretrained.sincnet.conv1d)
-            model.pyan_nn._sincnet_pool.conv1d.load_state_dict(pretrained.sincnet.conv1d.state_dict())
+
+            # Selectively copy only the Conv1D components (skip asteroid_filterbanks.Encoder)
+            # The first element in conv1d list is the asteroid_filterbanks.Encoder
+            # Copy only the nn.Conv1d parts (indices 1 and 2)
+            assert config.sincnet
+            if config.sincnet['ksize'] == 251:
+                model.pyan_nn._sincnet_pool.conv1d = copy.deepcopy(pretrained.sincnet.conv1d)
+                model.pyan_nn._sincnet_pool.conv1d.load_state_dict(pretrained.sincnet.conv1d.state_dict())
+            else:
+                for i in range(1, len(pretrained.sincnet.conv1d)):
+                    model.pyan_nn._sincnet_pool.conv1d[i] = copy.deepcopy(pretrained.sincnet.conv1d[i])
+                    model.pyan_nn._sincnet_pool.conv1d[i].load_state_dict(pretrained.sincnet.conv1d[i].state_dict())
+
             model.pyan_nn._sincnet_pool.pool1d = copy.deepcopy(pretrained.sincnet.pool1d)
             model.pyan_nn._sincnet_pool.pool1d.load_state_dict(pretrained.sincnet.pool1d.state_dict())
             model.pyan_nn._sincnet_pool.norm1d = copy.deepcopy(pretrained.sincnet.norm1d)
@@ -263,36 +331,37 @@ class SegmentationModel(transformers.PreTrainedModel):
             model.pyan_nn.activation.load_state_dict(pretrained.activation.state_dict())
 
         return model
-
-    def to_pyannote_model(self):
-        """Convert the current model to a pyannote segmentation model for use in pyannote pipelines."""
-
-        seg_model = PyanNet(sincnet={"stride": 10})
-        seg_model.hparams.update(self.pyan_nn.hparams)
-
-        seg_model._sincnet = copy.deepcopy(self.pyan_nn._sincnet_pool)
-        seg_model._sincnet.load_state_dict(self.pyan_nn._sincnet_pool.state_dict())
-
-        # if self.model.post_pool:
-        #     seg_model.post_pool = copy.deepcopy(self.model.post_pool)
-        #     seg_model.post_pool.load_state_dict(self.model.post_pool.state_dict())
-        #     print('post_pool copied')
-
-        seg_model.lstm = copy.deepcopy(self.pyan_nn.lstm)
-        seg_model.lstm.load_state_dict(self.pyan_nn.lstm.state_dict())
-
-        seg_model.linear = copy.deepcopy(self.pyan_nn.linear)
-        seg_model.linear.load_state_dict(self.pyan_nn.linear.state_dict())
-
-        seg_model.classifier = copy.deepcopy(self.pyan_nn.classifier)
-        seg_model.classifier.load_state_dict(self.pyan_nn.classifier.state_dict())
-
-        seg_model.activation = copy.deepcopy(self.pyan_nn.activation)
-        seg_model.activation.load_state_dict(self.pyan_nn.activation.state_dict())
-
-        seg_model.specifications = self.specifications
-
-        return seg_model
+#
+#     def to_pyannote_model(self):
+#         """Convert the current model to a pyannote segmentation model for use in pyannote pipelines."""
+#
+#         global _sincnet
+#         seg_model = PyanNet(sincnet=_sincnet)
+#         seg_model.hparams.update(self.pyan_nn.hparams)
+#
+#         seg_model._sincnet = copy.deepcopy(self.pyan_nn._sincnet_pool)
+#         seg_model._sincnet.load_state_dict(self.pyan_nn._sincnet_pool.state_dict())
+#
+#         # if self.model.post_pool:
+#         #     seg_model.post_pool = copy.deepcopy(self.model.post_pool)
+#         #     seg_model.post_pool.load_state_dict(self.model.post_pool.state_dict())
+#         #     print('post_pool copied')
+#
+#         seg_model.lstm = copy.deepcopy(self.pyan_nn.lstm)
+#         seg_model.lstm.load_state_dict(self.pyan_nn.lstm.state_dict())
+#
+#         seg_model.linear = copy.deepcopy(self.pyan_nn.linear)
+#         seg_model.linear.load_state_dict(self.pyan_nn.linear.state_dict())
+#
+#         seg_model.classifier = copy.deepcopy(self.pyan_nn.classifier)
+#         seg_model.classifier.load_state_dict(self.pyan_nn.classifier.state_dict())
+#
+#         seg_model.activation = copy.deepcopy(self.pyan_nn.activation)
+#         seg_model.activation.load_state_dict(self.pyan_nn.activation.state_dict())
+#
+#         seg_model.specifications = self.specifications
+#
+#         return seg_model
 
     @classmethod
     def from_checkpoint(cls, checkpoint: str|Path) -> 'SegmentationModel':
@@ -310,10 +379,14 @@ class SegmentationModel(transformers.PreTrainedModel):
         config_path = Path(checkpoint) / "config.json"
         with open(config_path, 'r') as f:
             config_dict = json.load(f)
+
+        SegmentationModelConfig.set_sincnet(config_dict['sincnet'])
         config = SegmentationModelConfig(**config_dict)
 
         # Initialize model with configuration
-        model = cls(config)
+        assert config.sincnet, f'{cls.__name__}: sincnet is required: {config.sincnet=}'
+
+        model = cls(config=config)
 
         # Load model weights
         model_weights_path = Path(checkpoint) / "model.safetensors"

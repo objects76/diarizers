@@ -63,9 +63,10 @@ class Preprocess:
             max_speakers_per_frame=config.max_speakers_per_frame,
             max_speakers_per_chunk=config.max_speakers_per_chunk,
             min_duration=config.min_duration,
-            warm_up=config.warm_up
+            warm_up=config.warm_up,
+            sincnet=config.sincnet,
         )
-        model:PyanNet_nn = SegmentationModel(model_config).pyan_nn
+        model:PyanNet_nn = SegmentationModel(config=model_config).pyan_nn
 
         # Get the number of frames associated to a chunk:
         _, self.num_frames_per_chunk, n_speakers = model(
