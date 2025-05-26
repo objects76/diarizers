@@ -23,7 +23,7 @@ class SegmentationModelConfig(transformers.PretrainedConfig):
     @staticmethod
     def set_sincnet(cfg):
         global _sincnet
-        print(f'SegmentationModelConfig: _sincnet: {_sincnet}\n -> {cfg}')
+        print(f'SegmentationModelConfig: _sincnet: {_sincnet}\n\t-> {cfg}')
         _sincnet = cfg
 
     model_type = "pyannet"
@@ -125,7 +125,11 @@ class SegmentationModel(transformers.PreTrainedModel):
         self.pyan_nn = PyanNet_nn(sincnet=config.sincnet)
         self.pyan_nn.specifications = self.specifications
         self.pyan_nn.build()
-        self._setup_loss_func()
+        self.setup_loss_func()
+        # logit to [ [0,1],... ]
+        self.conv = self.pyan_nn.powerset
+        assert self.specifications.powerset_max_classes == 2
+
 
     def forward(self,
                 waveforms: torch.Tensor,
@@ -163,11 +167,11 @@ class SegmentationModel(transformers.PreTrainedModel):
                 permutated_target, _ = permutate(multilabel, labels)
 
                 permutated_target_powerset = self.pyan_nn.powerset.to_powerset(permutated_target.float())
-                loss = self._segmentation_loss(prediction, permutated_target_powerset, weight=weight, each_loss=each_loss)
+                loss = self.segmentation_loss(prediction, permutated_target_powerset, weight=weight, each_loss=each_loss)
 
             else:
                 permutated_prediction, _ = permutate(labels, prediction)
-                loss = self._segmentation_loss(permutated_prediction, labels, weight=weight, each_loss=each_loss)
+                loss = self.segmentation_loss(permutated_prediction, labels, weight=weight, each_loss=each_loss)
 
             if each_loss:
                 return {"logits": prediction, "loss": loss.mean(), "losses": loss}
@@ -178,12 +182,25 @@ class SegmentationModel(transformers.PreTrainedModel):
 
     def test(self,
              waveforms: torch.Tensor,
-             labels: torch.Tensor) -> dict:
-        with torch.no_grad():
-            return self.forward(waveforms, labels, each_loss=True)
+             labels: torch.Tensor|None = None) -> dict:
+        # with torch.no_grad():
+        with torch.inference_mode(): # assert model.eval()
+            result = self.forward(waveforms, labels, each_loss=True)
+            result['powerset'] = self.conv.forward(result['logits']).type(torch.int8)
+            # result['powerset'] = result['powerset'].roll(1, dims=-1)  # Swap the last dimension values
+
+            if labels is not None:
+                failed = []
+                result['powerset'] = result['powerset'].type(labels.dtype)
+                for pred, label in zip(result['powerset'], labels):
+                    n_failed = (pred != label).any(dim=1).sum().item()  # Count failed predictions
+                    failed.append(n_failed / len(pred))
+
+                result['failed'] = torch.Tensor(failed)
+            return result # ['logits', 'powerset', 'failed'?]
 
 
-    def _setup_loss_func(self):
+    def setup_loss_func(self):
         """setup the loss function is self.specifications.powerset is True."""
         if self.specifications.powerset:
             self.pyan_nn.powerset = Powerset(
@@ -191,7 +208,7 @@ class SegmentationModel(transformers.PreTrainedModel):
                 self.specifications.powerset_max_classes,
             )
 
-    def _segmentation_loss(
+    def segmentation_loss(
         self,
         permutated_prediction: torch.Tensor,
         target: torch.Tensor,
