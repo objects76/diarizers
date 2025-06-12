@@ -26,7 +26,8 @@ kernel_size = 321   # 커널 크기 (약 20ms 컨텍스트)
 class SincNetPool(nn.Module):
     def __init__(self, sample_rate: int = 16000,
                  stride: int= 10, ksize: int = 251,
-                 frame_sec: float = 0.10384*0):
+                #  frame_sec: float = 0.10384*0
+                 ):
         super().__init__()
 
         assert sample_rate == 16000, "SincNetPool only supports 16kHz audio for now."
@@ -34,7 +35,7 @@ class SincNetPool(nn.Module):
         self.stride = stride
 
         # to use pretrained pyan weight and make output granularity bigger.
-        self.post_pool = None
+        # self.post_pool = None
 
         # 오디오 신호의 정규화를 위한 1D 인스턴스 정규화 레이어
         self.wav_norm1d = nn.InstanceNorm1d(1, affine=True)
@@ -71,19 +72,19 @@ class SincNetPool(nn.Module):
         self.pool1d.append(nn.MaxPool1d(kernel_size=3, stride=3, padding=0, dilation=1))
         self.norm1d.append(nn.InstanceNorm1d(num_features=60, affine=True))
 
-        if frame_sec > 0:
-            assert ksize == 251 and stride == 10, "SincNetPool only supports 251, 10 for now."
-            # 기존 스텝 크기 계산 (대략 0.017307692초)
-            base_step = 0.017307692
-
-            # 목표 스텝 크기(예: 0.102초)에 맞는 풀링 커널 크기 계산
-            pool_kernel: int = math.ceil(frame_sec / base_step)
-            pool_stride: int = pool_kernel
-
-            self.post_pool = (
-                nn.AvgPool1d(kernel_size=pool_kernel, stride=pool_stride, ceil_mode=True)
-            )
-            print(f"SincNetPool: {pool_kernel=}/{frame_sec / base_step:.3f}, {pool_stride=}, {frame_sec=}")
+        # if frame_sec > 0:
+        #     assert ksize == 251 and stride == 10, "SincNetPool only supports 251, 10 for now."
+        #     # 기존 스텝 크기 계산 (대략 0.017307692초)
+        #     base_step = 0.017307692
+        #
+        #     # 목표 스텝 크기(예: 0.102초)에 맞는 풀링 커널 크기 계산
+        #     pool_kernel: int = math.ceil(frame_sec / base_step)
+        #     pool_stride: int = pool_kernel
+        #
+        #     self.post_pool = (
+        #         nn.AvgPool1d(kernel_size=pool_kernel, stride=pool_stride, ceil_mode=True)
+        #     )
+        #     print(f"SincNetPool: {pool_kernel=}/{frame_sec / base_step:.3f}, {pool_stride=}, {frame_sec=}")
 
 
         self.model_cfg = {
@@ -168,8 +169,8 @@ class SincNetPool(nn.Module):
             # 풀링과 정규화, 그리고 활성화 함수 적용
             outputs = F.leaky_relu(norm1d(pool1d(outputs)))
 
-        if self.post_pool is not None:
-            outputs = self.post_pool(outputs)
+        # if self.post_pool is not None:
+        #     outputs = self.post_pool(outputs)
 
         return outputs
 
@@ -183,18 +184,18 @@ class SincNetPool(nn.Module):
         )
 
         # post_pool이 있는 경우 리셉티브 필드 정보를 조정
-        if self.post_pool is not None:
-            # post_pool이 있을 때 고정 커널 크기 6을 사용
-            pool_kernel = self.post_pool.kernel_size[0] # type: ignore
-            pool_stride = pool_kernel
-            print(f"post_pool: {pool_kernel=}, {pool_stride=}")
-
-            # post_pool로 인한 스텝 크기 조정
-            step = step * pool_stride
-
-            # post_pool로 인한 리셉티브 필드 크기 확장
-            size = size + (pool_kernel - 1) * step / pool_stride
-            # 시작 지점은 변하지 않음 (첫 번째 프레임의 중심점은 동일)
+        #if self.post_pool is not None:
+        #    # post_pool이 있을 때 고정 커널 크기 6을 사용
+        #    pool_kernel = self.post_pool.kernel_size[0] # type: ignore
+        #    pool_stride = pool_kernel
+        #    print(f"post_pool: {pool_kernel=}, {pool_stride=}")
+        #
+        #    # post_pool로 인한 스텝 크기 조정
+        #    step = step * pool_stride
+        #
+        #    # post_pool로 인한 리셉티브 필드 크기 확장
+        #    size = size + (pool_kernel - 1) * step / pool_stride
+        #    # 시작 지점은 변하지 않음 (첫 번째 프레임의 중심점은 동일)
 
         return start, size, step
 
@@ -205,7 +206,7 @@ if __name__ == "__main__":
     def test_sincnet_forward(sincnet=None):
         if sincnet is None:
             ksize, stride = 251, 10 # def
-            sincnet = SincNetPool(stride=stride, ksize=ksize, frame_sec=0.10384)
+            sincnet = SincNetPool(stride=stride, ksize=ksize)#, frame_sec=0.10384)
 
         # Calculate the number of samples for the given duration
         input_duration_sec = 2.25
@@ -237,7 +238,7 @@ if __name__ == "__main__":
         # ksize, stride = 321, 56
         frame_sec = 0.10384
         print(f'\n\ntest stride={stride}, ksize={ksize}')
-        sincnet = SincNetPool(stride=stride, ksize=ksize, frame_sec=frame_sec)
+        sincnet = SincNetPool(stride=stride, ksize=ksize)#, frame_sec=frame_sec)
 
         input_sec = 2.25
         n_frame = sincnet.num_frames(n_audio_samples=int(16000*input_sec))

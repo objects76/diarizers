@@ -152,6 +152,7 @@ class SegmentationModel(transformers.PreTrainedModel):
                 - "loss": labels가 제공된 경우의 계산된 손실 값
         """
 
+        waveforms = waveforms.to(self.device)
         prediction = self.pyan_nn(waveforms.unsqueeze(1))
         batch_size, num_frames, _ = prediction.shape
 
@@ -410,16 +411,16 @@ class SegmentationModel(transformers.PreTrainedModel):
         state_dict = load_file(model_weights_path)
         model.load_state_dict(state_dict)
 
-        return model
+        return model.to( torch.device('cuda' if torch.cuda.is_available() else 'cpu') )
 
     @cached_property
     def receptive_field(self) -> SlidingWindow:
         start, size, step = self.pyan_nn._sincnet_pool.receptive_field()
         sr = 16000
         return SlidingWindow(
-            start=start / sr,
             duration= size / sr,
             step=step / sr,
+            start=start / sr,
         )
 
 if __name__ == "__main__":

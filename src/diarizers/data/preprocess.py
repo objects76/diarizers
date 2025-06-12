@@ -243,10 +243,10 @@ class Preprocess:
             result = self.get_chunk(file, start_time, min_speaker=2)
             if result is None: continue
 
-            waveform, target, label = result
+            waveform, frame_labels, speakers = result
             new_batch["waveforms"].append(waveform)
-            new_batch["labels"].append(target)
-            new_batch["nb_speakers"].append(label)
+            new_batch["labels"].append(frame_labels)
+            new_batch["nb_speakers"].append(speakers)
 
         return new_batch
 
