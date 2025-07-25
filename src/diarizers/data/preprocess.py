@@ -28,6 +28,8 @@ import torch
 
 from diarizers.models import SegmentationModel, SegmentationModelConfig
 
+SR = 16_000
+CHUNK_DURATION = 2.25
 
 class Preprocess:
     """Converts a HF dataset with the following features:
@@ -49,38 +51,42 @@ class Preprocess:
             input_dataset (dataset): Hugging Face Speaker Diarization dataset
             model (SegmentationModel): A SegmentationModel from the diarizers library.
         """
-        self.chunk_duration = config.chunk_duration
-        self.max_speakers_per_frame = config.max_speakers_per_frame
-        self.max_speakers_per_chunk = config.max_speakers_per_chunk
-        self.min_duration = config.min_duration
-        self.warm_up = config.warm_up
+        assert config.chunk_duration == CHUNK_DURATION
+        # CHUNK_DURATION = config.chunk_duration # 2.25
+        # self.max_speakers_per_frame = config.max_speakers_per_frame # 2
+        # self.max_speakers_per_chunk = config.max_speakers_per_chunk # 2
+        # self.min_duration = config.min_duration # 0.0
+        # self.warm_up = config.warm_up # (0,0)
 
-        self.sample_rate = config.sample_rate
+        assert SR == config.sample_rate # 16000
 
         # 올바른 SegmentationModelConfig로 모델 초기화
         model_config = SegmentationModelConfig(
-            chunk_duration=config.chunk_duration,
-            max_speakers_per_frame=config.max_speakers_per_frame,
-            max_speakers_per_chunk=config.max_speakers_per_chunk,
-            min_duration=config.min_duration,
+            chunk_duration=CHUNK_DURATION,
+            max_speakers_per_frame=config.max_speakers_per_frame, # 2
+            max_speakers_per_chunk=config.max_speakers_per_chunk, # 2
+            min_duration=config.min_duration, # 0
             warm_up=config.warm_up,
-            sincnet=config.sincnet,
+            sincnet=config.sincnet, # {'ksize': 251, 'stride': 10}
         )
         model:PyanNet_nn = SegmentationModel(config=model_config).pyan_nn
 
         # Get the number of frames associated to a chunk:
         _, self.num_frames_per_chunk, n_speakers = model(
-            torch.rand((1, int(self.chunk_duration * self.sample_rate)))
+            torch.rand((1, int(CHUNK_DURATION * SR)))
         ).shape
 
+        # receptive field
         self.receptive_field_step = model.receptive_field.step
         self.receptive_field_duration = 0.5 * model.receptive_field.duration
         # self.post_pool_size = model.post_pool.kernel_size[0] if model.post_pool else 0
         print(f"{model.receptive_field.step=}")
         print(f"{model.receptive_field.duration=}")
-        print(f"{self.num_frames_per_chunk=} for {self.chunk_duration}")
+        print(f"{self.num_frames_per_chunk=} for {CHUNK_DURATION}")
+        del model
 
-    def get_labels_in_file(self, file):
+    @staticmethod
+    def get_labels_in_file(file):
         """Get speakers in file.
         Args:
             file (_type_): dataset row from input dataset.
@@ -96,7 +102,8 @@ class Preprocess:
 
         return file_labels
 
-    def get_segments_in_file(self, file, labels) -> np.ndarray:
+    @staticmethod
+    def get_segments_in_file(file, labels) -> np.ndarray:
         """Get segments in file.
 
         Args:
@@ -136,13 +143,11 @@ class Preprocess:
                 labels (list): list of speakers in chunk.
                 None: if the chunk doesn't meet requirements.
         """
-        sample_rate = file["audio"][0]["sampling_rate"]
+        assert file["audio"][0]["sampling_rate"] == SR
 
-        assert sample_rate == self.sample_rate
-
-        end_time = start_time + self.chunk_duration
-        start_frame = math.floor(start_time * sample_rate)
-        num_frames_waveform = math.floor(self.chunk_duration * sample_rate)
+        end_time = start_time + CHUNK_DURATION
+        start_frame = math.floor(start_time * SR)
+        num_frames_waveform = math.floor(CHUNK_DURATION * SR)
         end_frame = start_frame + num_frames_waveform
 
         waveform:np.ndarray = file["audio"][0]["array"][start_frame:end_frame]
@@ -152,10 +157,10 @@ class Preprocess:
 
         assert len(waveform) == num_frames_waveform
 
-        labels = self.get_labels_in_file(file)
+        labels = Preprocess.get_labels_in_file(file)
         # print('get_chunk.labels:', labels)
 
-        file_segments = self.get_segments_in_file(file, labels); del labels
+        file_segments = Preprocess.get_segments_in_file(file, labels); del labels
         # print('file_segments:', file_segments)
 
         # overlapped segments.
@@ -170,7 +175,7 @@ class Preprocess:
             return None
 
         # compute frame resolution:
-        # resolution = self.chunk_duration / self.num_frames_per_chunk
+        # resolution = CHUNK_DURATION / self.num_frames_per_chunk
 
         # discretize chunk annotations at model output resolution
         step = self.receptive_field_step
@@ -215,18 +220,15 @@ class Preprocess:
             start_positions: Numpy array containing the start positions of the audio chunks in file.
         """
 
-        sample_rate = file["audio"][0]["sampling_rate"]
-
-        assert sample_rate == self.sample_rate
+        assert file["audio"][0]["sampling_rate"] == SR
         assert overlap < 1, f"overlap must be less than 1"
-        assert self.chunk_duration > 0.0, f"self.chunk_duration must be greater than 0.0"
 
         step = 1 - overlap
-        file_duration = len(file["audio"][0]["array"]) / sample_rate
-        start_positions = np.arange(0, file_duration - self.chunk_duration, step = step)
+        file_duration = len(file["audio"][0]["array"]) / SR
+        start_positions = np.arange(0, file_duration - CHUNK_DURATION, step = step)
 
         if random:
-            nb_samples = int(file_duration / self.chunk_duration) # number of batch_samples
+            nb_samples = int(file_duration / CHUNK_DURATION) # number of batch_samples
             start_positions = np.random.uniform(0, file_duration, nb_samples)
 
         return start_positions
@@ -251,7 +253,7 @@ class Preprocess:
         return new_batch
 
     def __call__(self, file, random=False, overlap=0.0, min_person=2):
-        """Chunk an audio file into short segments of duration self.chunk_duration
+        """Chunk an audio file into short segments of duration CHUNK_DURATION
 
         Args:
             file (dict): dataset row containing the "audio" feature.
