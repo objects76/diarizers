@@ -73,7 +73,7 @@ class DataCollator:
 
         batch = {}
 
-        speakers = [f["nb_speakers"] for f in features]
+        speakers = [f["idx_speakers"] for f in features]
         labels = [f["labels"] for f in features]
 
         batch["labels"] = self.pad_targets(labels, speakers)

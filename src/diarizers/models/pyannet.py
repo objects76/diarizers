@@ -21,9 +21,7 @@ class Dict(dict):
         super(Dict, self).__init__(*args, **kwargs)
         self.__dict__ = self
 
-SINCNET_DEFAULTS = {"ksize": 251, "stride": 10, "frame_sec": 0} # to use pyan pretrained
-SINCNET_DEFAULTS = {"ksize": 251, "stride": 10, "frame_sec": 0.10384} # to use pyan pretrained, 22 frams for 2.25 sec
-SINCNET_DEFAULTS = {"ksize": 321, "stride": 56} # 21 frames for 2.25 sec
+
 
 class PyanNet_nn(torch.nn.Module):
     """PyanNet segmentation model adapted from PyanNet model used in pyannote.
@@ -53,31 +51,32 @@ class PyanNet_nn(torch.nn.Module):
         i.e. two linear layers with 128 units each.
     """
 
-    LSTM_DEFAULTS = {
-        "hidden_size": 128,
-        "num_layers": 4,
-        "bidirectional": True,
-        "monolithic": True,
-        "dropout": 0.0,
-    }
-    LINEAR_DEFAULTS = {"hidden_size": 128, "num_layers": 2}
-
     def __init__(
         self,
         sincnet: dict,
-        lstm: Optional[dict] = None,
-        linear: Optional[dict] = None,
+        lstm: dict|None = None,
+        linear: dict|None = None,
         sample_rate: int = 16000,
         num_channels: int = 1,
     ):
         super().__init__()
 
+        LSTM_DEFAULTS = {
+            "hidden_size": 128,
+            "num_layers": 4,
+            "bidirectional": True,
+            "monolithic": True,
+            "dropout": 0.0,
+        }
+        LINEAR_DEFAULTS = {"hidden_size": 128, "num_layers": 2}
+        # sincnet = sincnet or { "ksize": 251, "stride": 10}
+
         self.specifications = None
         # sincnet = merge_dict(self.SINCNET_DEFAULTS, sincnet)
         # sincnet["sample_rate"] = sample_rate
-        lstm = merge_dict(self.LSTM_DEFAULTS, lstm)
+        lstm = merge_dict(LSTM_DEFAULTS, lstm)
         lstm["batch_first"] = True
-        linear = merge_dict(self.LINEAR_DEFAULTS, linear)
+        linear = merge_dict(LINEAR_DEFAULTS, linear)
 
         self.hparams = Dict({
             "linear": {"hidden_size": 128, "num_layers": 2},
@@ -95,7 +94,7 @@ class PyanNet_nn(torch.nn.Module):
         })
         print(f"{sincnet=}")
         self.sincnet = sincnet
-        self._sincnet_pool = SincNetPool(sample_rate=16000, **sincnet)
+        self._sincnet_pool = SincNetPool(sample_rate=16000, stride=sincnet['stride'], ksize=sincnet['ksize'])
 
         monolithic = lstm["monolithic"]
         if monolithic:
@@ -182,6 +181,7 @@ class PyanNet_nn(torch.nn.Module):
 
         self.classifier = nn.Linear(in_features, self.dimension)
         self.activation = self.default_activation()
+        print(f'classfier: ({in_features}, {self.dimension})')
 
     @lru_cache
     def num_frames(self, num_samples: int) -> int:
@@ -225,19 +225,18 @@ class PyanNet_nn(torch.nn.Module):
 
         Parameters
         ----------
-        waveforms : (batch, channel, sample)
+        waveforms : (batch, channel, sample): (1, 1, 36000)
 
         Returns
         -------
         scores : (batch, frame, classes)
         """
 
-        outputs = self._sincnet_pool(waveforms)
+        outputs = self._sincnet_pool(waveforms) # (1, 60, 130)
 
         if self.hparams.lstm["monolithic"]:
-            outputs, _ = self.lstm(
-                rearrange(outputs, "batch feature frame -> batch frame feature")
-            )
+            outputs = rearrange(outputs, "batch feature frame -> batch frame feature") # (1, 130, 60)
+            outputs, _ = self.lstm(outputs) # (1, 130, 256)
         else:
             assert False, "lstm must be monolithic"
             outputs = rearrange(outputs, "batch feature frame -> batch frame feature")
@@ -249,8 +248,9 @@ class PyanNet_nn(torch.nn.Module):
         if self.hparams.linear["num_layers"] > 0:
             for linear in self.linear:
                 outputs = F.leaky_relu(linear(outputs))
+            # (1, 130, 128)
 
-        return self.activation(self.classifier(outputs))
+        return self.activation(self.classifier(outputs)) # (1, 130, num_classes)
 
 
 
@@ -298,15 +298,7 @@ class PyanNet(Model):
         i.e. two linear layers with 128 units each.
     """
 
-    SINCNET_DEFAULTS = {"stride": 10}
-    LSTM_DEFAULTS = {
-        "hidden_size": 128,
-        "num_layers": 2,
-        "bidirectional": True,
-        "monolithic": True,
-        "dropout": 0.0,
-    }
-    LINEAR_DEFAULTS = {"hidden_size": 128, "num_layers": 2}
+
 
     def __init__(
         self,
@@ -319,9 +311,18 @@ class PyanNet(Model):
     ):
         super().__init__(sample_rate=sample_rate, num_channels=num_channels, task=task)
 
-        lstm = merge_dict(self.LSTM_DEFAULTS, lstm)
+        LINEAR_DEFAULTS = {"hidden_size": 128, "num_layers": 2}
+        SINCNET_DEFAULTS = {"stride": 10}
+        LSTM_DEFAULTS = {
+            "hidden_size": 128,
+            "num_layers": 2,
+            "bidirectional": True,
+            "monolithic": True,
+            "dropout": 0.0,
+        }
+        lstm = merge_dict(LSTM_DEFAULTS, lstm)
         lstm["batch_first"] = True
-        linear = merge_dict(self.LINEAR_DEFAULTS, linear)
+        linear = merge_dict(LINEAR_DEFAULTS, linear)
         self.save_hyperparameters("sincnet", "lstm", "linear")
 
         sincnet = sincnet or SINCNET_DEFAULTS

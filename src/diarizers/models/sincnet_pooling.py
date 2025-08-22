@@ -25,6 +25,7 @@ kernel_size = 321   # 커널 크기 (약 20ms 컨텍스트)
 
 class SincNetPool(nn.Module):
     def __init__(self, sample_rate: int = 16000,
+                 *,
                  stride: int= 10, ksize: int = 251,
                 #  frame_sec: float = 0.10384*0
                  ):
@@ -203,10 +204,7 @@ class SincNetPool(nn.Module):
 
 if __name__ == "__main__":
 
-    def test_sincnet_forward(sincnet=None):
-        if sincnet is None:
-            ksize, stride = 251, 10 # def
-            sincnet = SincNetPool(stride=stride, ksize=ksize)#, frame_sec=0.10384)
+    def test_sincnet_forward(sincnet:SincNetPool):
 
         # Calculate the number of samples for the given duration
         input_duration_sec = 2.25
@@ -234,11 +232,13 @@ if __name__ == "__main__":
     # test_sincnet_forward()
 
     def receptive_field_test():
-        ksize, stride = 251, 10 # def
-        # ksize, stride = 321, 56
-        frame_sec = 0.10384
-        print(f'\n\ntest stride={stride}, ksize={ksize}')
-        sincnet = SincNetPool(stride=stride, ksize=ksize)#, frame_sec=frame_sec)
+        print(f"[ receptive_field_test ]")
+        # 1순위: 균형잡힌 성능
+        kernel_size = 251    # 15.6ms context (proven optimal)
+        stride = 20          # ~65 frames for 2.25s (34.6ms resolution)
+
+        print(f'test stride={stride}, ksize={kernel_size}')
+        sincnet = SincNetPool(stride=stride, ksize=kernel_size)
 
         input_sec = 2.25
         n_frame = sincnet.num_frames(n_audio_samples=int(16000*input_sec))

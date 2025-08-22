@@ -7,36 +7,39 @@ from pyannote.audio.core.task import Problem, Resolution, Specifications
 from pyannote.audio.utils.loss import binary_cross_entropy, nll_loss
 from pyannote.audio.utils.permutation import permutate
 from pyannote.audio.utils.powerset import Powerset
-import transformers
+from transformers.modeling_utils import PreTrainedModel
+from transformers.configuration_utils import PretrainedConfig
 
 from diarizers.models.pyannet import PyanNet_nn
 from diarizers.models.pyannet import PyanNet
 
 from functools import cached_property
 from pyannote.core import SlidingWindow
+from diarizers.models.sincnet_pooling import SincNetPool
 
-_sincnet:dict|None = None
+# _sincnet:dict|None = None
 
-class SegmentationModelConfig(transformers.PretrainedConfig):
+class SegmentationModelConfig(PretrainedConfig):
     """Config class associated with SegmentationModel model."""
 
-    @staticmethod
-    def set_sincnet(cfg):
-        global _sincnet
-        print(f'SegmentationModelConfig: _sincnet: {_sincnet}\n\t-> {cfg}')
-        _sincnet = cfg
+    # @staticmethod
+    # def set_sincnet(cfg):
+    #     global _sincnet
+    #     print(f'SegmentationModelConfig: _sincnet: {_sincnet}\n\t-> {cfg}')
+    #     _sincnet = cfg
 
     model_type = "pyannet"
 
     def __init__(
         self,
         *,
-        chunk_duration=10,
-        max_speakers_per_frame=2,
-        max_speakers_per_chunk=3,
+        chunk_duration:float=10.0,
+        max_speakers_per_frame:int=2,
+        max_speakers_per_chunk:int=3,
         min_duration=None,
         warm_up=(0.0, 0.0),
         weigh_by_cardinality=False,
+        sincnet = { "ksize": 251, "stride": 10},
         **kwargs,
     ):
         """Init method for the
@@ -76,13 +79,10 @@ class SegmentationModelConfig(transformers.PretrainedConfig):
         self.sample_rate = 16000
 
         # 추가 코드
-        global _sincnet
-        if _sincnet is None:
-            print(f'warning: \33[101m {self.__class__.__name__}: sincnet is required: {_sincnet=} \33[0m')
-        self.sincnet = _sincnet
+        self.sincnet = sincnet
 
 
-class SegmentationModel(transformers.PreTrainedModel):
+class SegmentationModel(PreTrainedModel):
     """
     Wrapper class for the PyanNet segmentation model used in pyannote.
     Inherits from Pretrained model to be compatible with the HF Trainer.
@@ -123,7 +123,7 @@ class SegmentationModel(transformers.PreTrainedModel):
         )
 
         self.pyan_nn = PyanNet_nn(sincnet=config.sincnet)
-        self.pyan_nn.specifications = self.specifications
+        self.pyan_nn.specifications = self.specifications # type:ignore
         self.pyan_nn.build()
         self.setup_loss_func()
         # logit to [ [0,1],... ]
@@ -134,7 +134,7 @@ class SegmentationModel(transformers.PreTrainedModel):
     def forward(self,
                 waveforms: torch.Tensor,
                 labels: Optional[torch.Tensor] = None,
-                nb_speakers: Optional[int] = None,
+                idx_speakers: Optional[int] = None,
                 each_loss: bool = False) -> dict:
         """Forward pass of the Pretrained Model.
 
@@ -143,7 +143,7 @@ class SegmentationModel(transformers.PreTrainedModel):
                 16kHz 샘플링 레이트의 raw 오디오 파형이어야 합니다.
             labels (torch.Tensor, optional): 화자 활동 레이블 텐서.
                 Shape: (batch_size, num_frames, num_speakers). Defaults to None.
-            nb_speakers (int, optional): 오디오 클립의 총 화자 수.
+            idx_speakers (int, optional): 오디오 클립의 총 화자 수.
                 일부 처리 로직에서 사용될 수 있습니다. Defaults to None.
 
         Returns:
@@ -284,7 +284,7 @@ class SegmentationModel(transformers.PreTrainedModel):
 
 
     @classmethod
-    def from_pyannote_model(cls, pretrained, *, with_weight=True):
+    def from_pyannote_model(cls, pretrained, *, with_weight=True, sincnet:dict|None = None):
         """Copy the weights and architecture of a pre-trained Pyannote model.
 
         Args:
@@ -309,13 +309,15 @@ class SegmentationModel(transformers.PreTrainedModel):
             warm_up=warm_up,
             max_speakers_per_chunk=max_speakers_per_chunk,
         )
+        if sincnet is not None:
+            config.sincnet = sincnet
 
         model:SegmentationModel = cls(config=config)
 
         # Copy pretrained model weights:
         if with_weight:
-            print('before copy:', model.pyan_nn._sincnet_pool)
             model.pyan_nn.hparams = copy.deepcopy(pretrained.hparams)
+
             # 구조적으로 다른 SincNet과 SincNetPool 간의 가중치 복사
             # model.pyan_nn._sincnet_pool = copy.deepcopy(pretrained.sincnet)
             # model.pyan_nn._sincnet_pool.load_state_dict(pretrained.sincnet.state_dict())
@@ -326,19 +328,21 @@ class SegmentationModel(transformers.PreTrainedModel):
             # The first element in conv1d list is the asteroid_filterbanks.Encoder
             # Copy only the nn.Conv1d parts (indices 1 and 2)
             assert config.sincnet
-            if config.sincnet['ksize'] == 251:
-                model.pyan_nn._sincnet_pool.conv1d = copy.deepcopy(pretrained.sincnet.conv1d)
-                model.pyan_nn._sincnet_pool.conv1d.load_state_dict(pretrained.sincnet.conv1d.state_dict())
-            else:
-                for i in range(1, len(pretrained.sincnet.conv1d)):
-                    model.pyan_nn._sincnet_pool.conv1d[i] = copy.deepcopy(pretrained.sincnet.conv1d[i])
-                    model.pyan_nn._sincnet_pool.conv1d[i].load_state_dict(pretrained.sincnet.conv1d[i].state_dict())
+            # ksize, stride values do not effect the trainable params.
+            copied_sincnet:SincNetPool = copy.deepcopy(pretrained.sincnet)
+            copied_sincnet.conv1d[0] = model.pyan_nn._sincnet_pool.conv1d[0] # filterbank encoder
+            model.pyan_nn._sincnet_pool = copied_sincnet
 
-            model.pyan_nn._sincnet_pool.pool1d = copy.deepcopy(pretrained.sincnet.pool1d)
-            model.pyan_nn._sincnet_pool.pool1d.load_state_dict(pretrained.sincnet.pool1d.state_dict())
-            model.pyan_nn._sincnet_pool.norm1d = copy.deepcopy(pretrained.sincnet.norm1d)
-            model.pyan_nn._sincnet_pool.norm1d.load_state_dict(pretrained.sincnet.norm1d.state_dict())
+            # start = 0 if config.sincnet['ksize'] == 251 else 1
+            # for i in range(start, len(pretrained.sincnet.conv1d)):
+            #     model.pyan_nn._sincnet_pool.conv1d[i] = copy.deepcopy(pretrained.sincnet.conv1d[i])
+            #     model.pyan_nn._sincnet_pool.conv1d[i].load_state_dict(pretrained.sincnet.conv1d[i].state_dict())
+            # model.pyan_nn._sincnet_pool.pool1d = copy.deepcopy(pretrained.sincnet.pool1d)
+            # model.pyan_nn._sincnet_pool.pool1d.load_state_dict(pretrained.sincnet.pool1d.state_dict())
+            # model.pyan_nn._sincnet_pool.norm1d = copy.deepcopy(pretrained.sincnet.norm1d)
+            # model.pyan_nn._sincnet_pool.norm1d.load_state_dict(pretrained.sincnet.norm1d.state_dict())
             # no model.pyan_nn._sincnet_pool.post_pool layer in SincNet
+
             model.pyan_nn.lstm = copy.deepcopy(pretrained.lstm)
             model.pyan_nn.lstm.load_state_dict(pretrained.lstm.state_dict())
             model.pyan_nn.linear = copy.deepcopy(pretrained.linear)
@@ -398,7 +402,7 @@ class SegmentationModel(transformers.PreTrainedModel):
         with open(config_path, 'r') as f:
             config_dict = json.load(f)
 
-        SegmentationModelConfig.set_sincnet(config_dict['sincnet'])
+        # SegmentationModelConfig.set_sincnet(config_dict['sincnet'])
         config = SegmentationModelConfig(**config_dict)
 
         # Initialize model with configuration
